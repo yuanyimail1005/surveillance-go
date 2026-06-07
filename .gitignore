@@ -1,0 +1,14 @@
+node_modules/
+.env
+*.log
+*.swp
+__pycache__/
+cert.pem
+key.pem
+output.log
+surveillance.log
+*.pyc
+.DS_Store
+
+# Go build artifacts
+main
