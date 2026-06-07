@@ -35,6 +35,7 @@ type Config struct {
 	FaceRecognitionDetectEveryNFrames int
 	FaceRecognitionMatchThreshold     float64
 	FaceRecognitionMaxFaces           int
+	FaceRecognitionCascadePath        string
 }
 
 func Load() Config {
@@ -51,11 +52,16 @@ func Load() Config {
 		return filepath.Clean(filepath.Join(wd, value))
 	}
 
+	cascadePath := ""
+	if rawCascade := getenv("FACE_RECOGNITION_CASCADE_PATH", ""); rawCascade != "" {
+		cascadePath = resolve(rawCascade)
+	}
+
 	cfg := Config{
 		ServerHost:  getenv("SERVER_HOST", "0.0.0.0"),
 		ServerPort:  getenvInt("SERVER_PORT", 5000),
-		SSLCertPath: resolve(getenv("SSL_CERT_PATH", "/home/eric/certs/cert.pem")),
-		SSLKeyPath:  resolve(getenv("SSL_KEY_PATH", "/home/eric/certs/key.pem")),
+		SSLCertPath: resolve(getenv("SSL_CERT_PATH", "./cert.pem")),
+		SSLKeyPath:  resolve(getenv("SSL_KEY_PATH", "./key.pem")),
 
 		CameraDevice: getenv("CAMERA_DEVICE", "/dev/video0"),
 		CameraWidth:  getenvInt("CAMERA_WIDTH", 1920),
@@ -78,6 +84,7 @@ func Load() Config {
 		FaceRecognitionDetectEveryNFrames: getenvIntAllowUnset("FACE_RECOGNITION_DETECT_EVERY_N_FRAMES", 0),
 		FaceRecognitionMatchThreshold:     getenvFloat("FACE_RECOGNITION_MATCH_THRESHOLD", 0.6),
 		FaceRecognitionMaxFaces:           getenvInt("FACE_RECOGNITION_MAX_FACES", 8),
+		FaceRecognitionCascadePath:        cascadePath,
 	}
 
 	if cfg.FaceRecognitionDetectEveryNFrames <= 0 {

@@ -14,15 +14,19 @@ This project preserves the same UI and API/WebSocket contract as the Node implem
 - Speaker volume control
 - Snapshot and browser-side recording in the existing UI
 - HTTPS/WSS transport
-- Face-recognition API compatibility endpoints (`/face_status`, `/face_settings`)
+- Server-side face detection and known-face matching (OpenCV Haar + LBPH)
 
-## Important Note About Face Recognition
+## Face Recognition
 
-The Go version currently ships an API-compatible face-recognition stub backend (`go-face-stub`) so the UI toggles and status panel continue working.
+The Go backend now performs face detection and matching locally using OpenCV:
 
-- Endpoints are present and return valid payloads.
-- The Go service does not yet perform server-side ML face detection/recognition.
-- Existing UI overlays remain functional, but no recognized faces are produced by the backend.
+- Face detection: Haar cascade (`haarcascade_frontalface_default.xml`)
+- Face matching: LBPH face recognizer trained from `FACE_RECOGNITION_KNOWN_FACES_DIR`
+- One subfolder per person, JPEG/PNG files inside each folder
+
+Optional environment override:
+
+- `FACE_RECOGNITION_CASCADE_PATH` to provide an explicit cascade file path
 
 ## Prerequisites
 
@@ -31,7 +35,15 @@ The Go version currently ships an API-compatible face-recognition stub backend (
 - `ffmpeg`
 - `pulseaudio`, `pulseaudio-utils`
 - `v4l2-ctl`
+- OpenCV + OpenCV contrib runtime/development packages (for GoCV)
 - camera device (`/dev/video*` and/or `rpicam-*` tools on Raspberry Pi)
+
+Example Debian install for face recognition dependencies:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y libopencv-dev libopencv-contrib-dev
+```
 
 ## Configuration
 

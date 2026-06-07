@@ -12,3 +12,4 @@ surveillance.log
 
 # Go build artifacts
 main
+server.pid
