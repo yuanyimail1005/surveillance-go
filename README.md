@@ -2,18 +2,18 @@
 
 Go implementation of the Raspberry Pi surveillance system with browser-based live video/audio, two-way talkback, camera and audio controls, snapshot capture, and video recording.
 
-This project preserves the same UI and API/WebSocket contract as the Node implementation in `/home/eric/surveillance-node`, so the frontend behavior remains the same.
+The HTTP control API remains aligned with the Node implementation in `/home/eric/surveillance-node`, while live media transport now uses WebRTC instead of WebSocket media sockets.
 
 ## Features
 
-- Live MJPEG video streaming over WebSocket
-- Live microphone audio streaming from server to browser
-- Two-way talkback from browser microphone to server speakers
+- Live video streaming over WebRTC video tracks
+- Live microphone audio streaming from server to browser over WebRTC audio tracks
+- Two-way talkback over the WebRTC session
 - Camera resolution, FPS, and device selection controls
 - Server microphone/speaker selection
 - Speaker volume control
 - Snapshot and browser-side recording in the existing UI
-- HTTPS/WSS transport
+- HTTPS + WebRTC transport
 - Server-side face detection and known-face matching (OpenCV Haar + LBPH)
 
 ## Face Recognition
@@ -89,12 +89,13 @@ HTTP:
 - `POST /speaker_volume`
 - `GET /face_status`
 - `POST /face_settings`
+- `POST /webrtc/connect`
 
-WebSocket:
+WebRTC:
 
-- `/video_feed`
-- `/audio_feed`
-- `/ws/talk`
+- `POST /webrtc/connect` exchanges SDP offer/answer for the browser peer connection
+- Remote media is delivered over native WebRTC audio/video tracks
+- Face metadata and talkback control data travel over WebRTC data channels
 
 ## Docker
 

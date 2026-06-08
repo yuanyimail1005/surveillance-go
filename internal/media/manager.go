@@ -2,6 +2,7 @@ package media
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,6 +17,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"golang.org/x/sync/semaphore"
 
 	"surveillance-go/internal/config"
 )
@@ -44,13 +47,14 @@ type Manager struct {
 	audioPlaybackCmd *exec.Cmd
 	audioPlaybackIn  io.WriteCloser
 
-	videoSubscribers map[*WSClient]struct{}
-	audioSubscribers map[*WSClient]struct{}
+	videoSubscribers map[Subscriber]struct{}
+	audioSubscribers map[Subscriber]struct{}
 
 	videoBuffer    []byte
 	frameSeq       int64
 	videoFrameHook func([]byte, int64)
 
+	broadcastSem *semaphore.Weighted
 	shuttingDown bool
 }
 
@@ -67,6 +71,12 @@ type Resolution struct {
 	Height int `json:"height"`
 }
 
+type Subscriber interface {
+	WriteBinary([]byte) error
+	WriteText([]byte) error
+	Close() error
+}
+
 func New(cfg config.Config) *Manager {
 	return &Manager{
 		cfg:                    cfg,
@@ -74,9 +84,10 @@ func New(cfg config.Config) *Manager {
 		cameraDevicePreference: cfg.CameraDevice,
 		pulseSinkName:          cfg.PulseSinkName,
 		pulseCaptureSourceName: cfg.PulseCaptureSourceName,
-		videoSubscribers:       make(map[*WSClient]struct{}),
-		audioSubscribers:       make(map[*WSClient]struct{}),
+		videoSubscribers:       make(map[Subscriber]struct{}),
+		audioSubscribers:       make(map[Subscriber]struct{}),
 		videoBuffer:            make([]byte, 0),
+		broadcastSem:           semaphore.NewWeighted(8),
 	}
 }
 
@@ -92,18 +103,28 @@ func (m *Manager) BroadcastVideoJSON(payload any) {
 		return
 	}
 	m.mu.RLock()
-	clients := make([]*WSClient, 0, len(m.videoSubscribers))
+	clients := make([]Subscriber, 0, len(m.videoSubscribers))
 	for c := range m.videoSubscribers {
 		clients = append(clients, c)
 	}
 	m.mu.RUnlock()
 
+	// Broadcast to all clients concurrently with bounded concurrency.
+	var wg sync.WaitGroup
+	ctx := context.Background()
 	for _, c := range clients {
-		_ = c.WriteText(body)
+		wg.Add(1)
+		go func(client Subscriber) {
+			defer wg.Done()
+			_ = m.broadcastSem.Acquire(ctx, 1)
+			defer m.broadcastSem.Release(1)
+			_ = client.WriteText(body)
+		}(c)
 	}
+	wg.Wait()
 }
 
-func (m *Manager) SubscribeVideo(c *WSClient) {
+func (m *Manager) SubscribeVideo(c Subscriber) {
 	m.mu.Lock()
 	m.videoSubscribers[c] = struct{}{}
 	startNeeded := m.cameraCmd == nil
@@ -114,7 +135,7 @@ func (m *Manager) SubscribeVideo(c *WSClient) {
 	}
 }
 
-func (m *Manager) UnsubscribeVideo(c *WSClient) {
+func (m *Manager) UnsubscribeVideo(c Subscriber) {
 	m.mu.Lock()
 	delete(m.videoSubscribers, c)
 	stopNeeded := len(m.videoSubscribers) == 0
@@ -125,7 +146,7 @@ func (m *Manager) UnsubscribeVideo(c *WSClient) {
 	}
 }
 
-func (m *Manager) SubscribeAudio(c *WSClient) {
+func (m *Manager) SubscribeAudio(c Subscriber) {
 	m.mu.Lock()
 	m.audioSubscribers[c] = struct{}{}
 	startNeeded := m.audioCaptureCmd == nil
@@ -136,7 +157,7 @@ func (m *Manager) SubscribeAudio(c *WSClient) {
 	}
 }
 
-func (m *Manager) UnsubscribeAudio(c *WSClient) {
+func (m *Manager) UnsubscribeAudio(c Subscriber) {
 	m.mu.Lock()
 	delete(m.audioSubscribers, c)
 	stopNeeded := len(m.audioSubscribers) == 0
@@ -362,6 +383,25 @@ func (m *Manager) ListOutputSinks() []map[string]any {
 	return sinks
 }
 
+// ListAllDevices returns both capture and playback devices concurrently.
+func (m *Manager) ListAllDevices() ([]map[string]any, []map[string]any) {
+	captureChan := make(chan []map[string]any)
+	playbackChan := make(chan []map[string]any)
+
+	// Enumerate devices in parallel.
+	go func() {
+		captureChan <- m.ListCaptureDevices()
+	}()
+	go func() {
+		playbackChan <- m.ListOutputSinks()
+	}()
+
+	captureDevices := <-captureChan
+	playbackDevices := <-playbackChan
+
+	return captureDevices, playbackDevices
+}
+
 func (m *Manager) GetSpeakerVolume() (int, bool) {
 	if !m.ensurePulseAudioReady() {
 		return 0, false
@@ -522,7 +562,7 @@ func (m *Manager) handleCameraBytes(chunk []byte, frameHook func([]byte, int64))
 	}
 	m.frameSeq++
 	seq := m.frameSeq
-	clients := make([]*WSClient, 0, len(m.videoSubscribers))
+	clients := make([]Subscriber, 0, len(m.videoSubscribers))
 	for c := range m.videoSubscribers {
 		clients = append(clients, c)
 	}
@@ -614,7 +654,7 @@ func (m *Manager) startAudioCapture() error {
 
 func (m *Manager) broadcastAudio(chunk []byte) {
 	m.mu.RLock()
-	clients := make([]*WSClient, 0, len(m.audioSubscribers))
+	clients := make([]Subscriber, 0, len(m.audioSubscribers))
 	for c := range m.audioSubscribers {
 		clients = append(clients, c)
 	}

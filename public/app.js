@@ -12,8 +12,11 @@ const speakerSelect = document.getElementById('speaker');
 const volumeInput = document.getElementById('volume');
 
 let audioCtx;
-let audioSocket;
-let talkSocket;
+let peerConnection;
+let videoBinaryChannel;
+let videoTextChannel;
+let audioBinaryChannel;
+let talkBinaryChannel;
 let mediaRecorder;
 const cameraResolutionsByDevice = new Map();
 let currentVideoObjectUrl = null;
@@ -149,50 +152,89 @@ const fetchJson = async (url, opts) => {
   return data;
 };
 
-const startVideo = () => {
-  const ws = new WebSocket(`${wsBase}/video_feed`);
-  ws.binaryType = 'blob';
-  ws.onmessage = (event) => {
-    if (event.data instanceof Blob) {
-      // Binary JPEG frame — keep only the newest while decode/render is busy.
-      pendingVideoBlob = event.data;
-      renderLatestVideoFrame();
-    } else if (typeof event.data === 'string') {
-      // JSON message from the server (face_data, etc.).
-      try {
-        const msg = JSON.parse(event.data);
-        if (msg.type === 'face_data') handleServerFaceData(msg);
-      } catch (_) {}
-    }
-  };
-  ws.onclose = () => {
-    latestFaces = [];
-    latestFaceImageSize = { width: 0, height: 0 };
-    drawFaceOverlay(latestFaces, 0, 0);
-    setFaceStatus('Face AI: server not connected');
-    pendingVideoBlob = null;
-    videoDecodeInFlight = false;
-    if (currentVideoObjectUrl) {
-      URL.revokeObjectURL(currentVideoObjectUrl);
-      currentVideoObjectUrl = null;
-    }
-  };
+const createRtcDataChannel = (pc, label, options = {}) => {
+  const channel = pc.createDataChannel(label, options);
+  channel.binaryType = 'arraybuffer';
+  return channel;
 };
 
-const startAudio = () => {
-  audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 48000 });
-  nextAudioPlayTime = audioCtx.currentTime;
-  audioSocket = new WebSocket(`${wsBase}/audio_feed`);
-  audioSocket.binaryType = 'arraybuffer';
-  audioSocket.onmessage = async (event) => {
+const setupWebRTC = async () => {
+  peerConnection = new RTCPeerConnection();
+
+  videoBinaryChannel = createRtcDataChannel(peerConnection, 'video-binary', { ordered: false, maxRetransmits: 0 });
+  videoTextChannel = createRtcDataChannel(peerConnection, 'video-text');
+  audioBinaryChannel = createRtcDataChannel(peerConnection, 'audio-binary', { ordered: false, maxRetransmits: 0 });
+  talkBinaryChannel = createRtcDataChannel(peerConnection, 'talk-binary', { ordered: false, maxRetransmits: 0 });
+
+  videoBinaryChannel.onmessage = (event) => {
+    pendingVideoBlob = new Blob([event.data], { type: 'image/jpeg' });
+    renderLatestVideoFrame();
+  };
+  videoTextChannel.onmessage = (event) => {
+    try {
+      const msg = JSON.parse(event.data);
+      if (msg.type === 'face_data') handleServerFaceData(msg);
+    } catch (_) {}
+  };
+  audioBinaryChannel.onmessage = (event) => {
     const sampleCount = Math.floor(event.data.byteLength / 2);
     if (sampleCount <= 0) return;
     const data = new Int16Array(event.data, 0, sampleCount);
     playAudioChunk(data);
   };
-  audioSocket.onclose = () => {
-    resetVolumeMeter('speaker-volume-bar', 'speaker-volume-text', 'speaker');
+
+  peerConnection.onconnectionstatechange = () => {
+    if (peerConnection.connectionState === 'disconnected' || peerConnection.connectionState === 'failed' || peerConnection.connectionState === 'closed') {
+      latestFaces = [];
+      latestFaceImageSize = { width: 0, height: 0 };
+      drawFaceOverlay(latestFaces, 0, 0);
+      setFaceStatus('Face AI: server not connected');
+      resetVolumeMeter('speaker-volume-bar', 'speaker-volume-text', 'speaker');
+      pendingVideoBlob = null;
+      videoDecodeInFlight = false;
+      if (currentVideoObjectUrl) {
+        URL.revokeObjectURL(currentVideoObjectUrl);
+        currentVideoObjectUrl = null;
+      }
+    }
   };
+
+  const offer = await peerConnection.createOffer();
+  await peerConnection.setLocalDescription(offer);
+  await new Promise((resolve) => {
+    if (peerConnection.iceGatheringState === 'complete') {
+      resolve();
+      return;
+    }
+    const onIceGatheringStateChange = () => {
+      if (peerConnection.iceGatheringState === 'complete') {
+        peerConnection.removeEventListener('icegatheringstatechange', onIceGatheringStateChange);
+        resolve();
+      }
+    };
+    peerConnection.addEventListener('icegatheringstatechange', onIceGatheringStateChange);
+  });
+
+  const answer = await fetchJson('/webrtc/connect', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      sdp: peerConnection.localDescription.sdp,
+      type: peerConnection.localDescription.type,
+    }),
+  });
+
+  await peerConnection.setRemoteDescription(answer);
+};
+
+const startVideo = () => {
+  return setupWebRTC();
+};
+
+const startAudio = () => {
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 48000 });
+  nextAudioPlayTime = audioCtx.currentTime;
+  resetVolumeMeter('speaker-volume-bar', 'speaker-volume-text', 'speaker');
 };
 
 const rmsToPercent = (rms) => {
@@ -439,20 +481,6 @@ const startTalk = async () => {
       }
     });
 
-    // Create WebSocket for sending audio
-    talkSocket = new WebSocket(`${wsBase}/ws/talk`);
-    talkSocket.binaryType = 'arraybuffer';
-    
-    talkSocket.onerror = (error) => {
-      console.error('Talk socket error:', error);
-      stopTalk();
-    };
-    
-    talkSocket.onclose = () => {
-      console.log('Talk socket closed');
-      if (isTalking) stopTalk();
-    };
-
     // Create audio context if not exists
     if (!audioCtx) {
       audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 48000 });
@@ -464,7 +492,7 @@ const startTalk = async () => {
 
     let sendCount = 0;
     scriptProcessor.onaudioprocess = (event) => {
-      if (!isTalking || talkSocket.readyState !== WebSocket.OPEN) return;
+      if (!isTalking || !talkBinaryChannel || talkBinaryChannel.readyState !== 'open') return;
 
       const inputData = event.inputBuffer.getChannelData(0);
       
@@ -486,7 +514,7 @@ const startTalk = async () => {
 
       // Send to server
       try {
-        talkSocket.send(int16.buffer);
+        talkBinaryChannel.send(int16.buffer);
       } catch (e) {
         console.error('Failed to send audio chunk:', e);
       }
@@ -531,12 +559,6 @@ const stopTalk = () => {
     micStream = null;
   }
   
-  // Close WebSocket
-  if (talkSocket && (talkSocket.readyState === WebSocket.OPEN || talkSocket.readyState === WebSocket.CONNECTING)) {
-    talkSocket.close();
-    talkSocket = null;
-  }
-  
   // Reset microphone meter
   resetVolumeMeter('mic-volume-bar', 'mic-volume-text', 'mic');
   document.getElementById('talkToggle').textContent = 'Hold to Talk';
@@ -552,7 +574,7 @@ document.getElementById('talkToggle').onclick = async () => {
 };
 
 (async () => {
-  startVideo();
+  await startVideo();
   startAudio();
   await loadCameraSettings();
   await loadAudioDevices();

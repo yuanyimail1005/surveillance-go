@@ -555,8 +555,9 @@
         <div class="content">
             <div class="video-section">
                 <div class="video-feed-wrapper">
-                    <img id="video-feed" alt="Live Video Feed">
+                    <video id="video-feed" autoplay playsinline></video>
                     <canvas id="face-overlay"></canvas>
+                    <audio id="remote-audio" autoplay style="display:none;"></audio>
                 </div>
                 <div class="video-tools">
                     <div style="display:flex; gap:12px; align-items:flex-end;">
@@ -740,6 +741,15 @@
         let listenSocket = null;
         let listenReconnectTimer = null;
         let talkSocket = null;
+        let peerConnection = null;
+        let faceDataChannel = null;
+        let talkDataChannel = null;
+        let remoteVideoStream = null;
+        let remoteAudioStream = null;
+        let remoteAudioElement = null;
+        let remoteAudioMeterSource = null;
+        let remoteAudioMeterProcessor = null;
+        let remoteAudioMeterSink = null;
         let talkWorkletModulePromise = null;
         let speakerVolumeDebounceTimer = null;
         let faceStatusTimer = null;
@@ -823,7 +833,7 @@
         function createTalkSocket(sessionId) {
             return new Promise((resolve, reject) => {
                 const scheme = window.location.protocol === 'https:' ? 'wss' : 'ws';
-                const socket = new WebSocket(`${scheme}://${window.location.host}/ws/talk`);
+                const socket = new WebSocket(`${scheme}://${window.location.host}/webrtc/connect`);
                 socket.binaryType = 'arraybuffer';
 
                 socket.addEventListener('open', () => {
@@ -849,7 +859,7 @@
 
         function createListenSocket() {
             return new Promise((resolve, reject) => {
-                const socket = openBinarySocket('/audio_feed', 'arraybuffer');
+                const socket = openBinarySocket('/webrtc/connect', 'arraybuffer');
 
                 socket.addEventListener('open', () => {
                     resolve(socket);
@@ -1044,7 +1054,7 @@
 
             videoExpectedClose = false;
 
-            videoSocket = openBinarySocket('/video_feed', 'blob');
+            videoSocket = openBinarySocket('/webrtc/connect', 'blob');
 
             videoSocket.addEventListener('open', () => {
                 videoReconnectAttempt = 0;
@@ -1388,7 +1398,7 @@
             nextRecordingAudioTime = audioContext.currentTime;
 
             return new Promise((resolve, reject) => {
-                const socket = openBinarySocket('/audio_feed', 'arraybuffer');
+                const socket = openBinarySocket('/webrtc/connect', 'arraybuffer');
                 let opened = false;
 
                 socket.addEventListener('open', () => {
@@ -1554,7 +1564,9 @@
             }
 
             const feed = document.getElementById('video-feed');
-            if (feed && feed.naturalWidth > 0 && feed.naturalHeight > 0) {
+            const feedSourceWidth = Number(feed?.videoWidth || feed?.naturalWidth || 0);
+            const feedSourceHeight = Number(feed?.videoHeight || feed?.naturalHeight || 0);
+            if (feed && feedSourceWidth > 0 && feedSourceHeight > 0) {
                 const rotation = recordingRotationDegrees;
                 recordingContext.fillStyle = '#000';
                 recordingContext.fillRect(0, 0, recordingCanvas.width, recordingCanvas.height);
@@ -1563,10 +1575,10 @@
                 recordingContext.rotate((rotation * Math.PI) / 180);
                 recordingContext.drawImage(
                     feed,
-                    -feed.naturalWidth / 2,
-                    -feed.naturalHeight / 2,
-                    feed.naturalWidth,
-                    feed.naturalHeight
+                    -feedSourceWidth / 2,
+                    -feedSourceHeight / 2,
+                    feedSourceWidth,
+                    feedSourceHeight
                 );
                 recordingContext.restore();
             }
@@ -1613,8 +1625,8 @@
 
             try {
                 setRecordingStatus('Starting recording...');
-                const sourceWidth = Math.max(1, Number(cameraSettings.width || feed.naturalWidth || 1280));
-                const sourceHeight = Math.max(1, Number(cameraSettings.height || feed.naturalHeight || 720));
+                const sourceWidth = Math.max(1, Number(cameraSettings.width || feed.videoWidth || feed.naturalWidth || 1280));
+                const sourceHeight = Math.max(1, Number(cameraSettings.height || feed.videoHeight || feed.naturalHeight || 720));
                 recordingRotationDegrees = getSelectedRotationDegrees();
                 const isQuarterTurn = recordingRotationDegrees === 90 || recordingRotationDegrees === 270;
                 const width = isQuarterTurn ? sourceHeight : sourceWidth;
@@ -1758,7 +1770,9 @@
         async function takeSnapshot() {
             const feed = document.getElementById('video-feed');
             const faceOverlay = document.getElementById('face-overlay');
-            if (!feed || !feed.naturalWidth || !feed.naturalHeight) {
+            const sourceWidth = Number(feed?.videoWidth || feed?.naturalWidth || 0);
+            const sourceHeight = Number(feed?.videoHeight || feed?.naturalHeight || 0);
+            if (!feed || !sourceWidth || !sourceHeight) {
                 setRecordingStatus('Snapshot failed: no video frame available');
                 return;
             }
@@ -1766,8 +1780,8 @@
             if (btn) btn.disabled = true;
             try {
                 const canvas = document.createElement('canvas');
-                canvas.width = feed.naturalWidth;
-                canvas.height = feed.naturalHeight;
+                canvas.width = sourceWidth;
+                canvas.height = sourceHeight;
                 const ctx = canvas.getContext('2d');
                 ctx.drawImage(feed, 0, 0);
 
@@ -2243,7 +2257,10 @@
 
         function handleFaceDataPush(data) {
             const status = document.getElementById('face-ai-status');
-            if (!data.enabled) {
+            if (!data || (data.type && data.type !== 'face_data')) {
+                return;
+            }
+            if (data.enabled === false) {
                 if (status) {
                     status.innerHTML = '<strong>Face AI:</strong> Disabled';
                 }
@@ -2255,7 +2272,7 @@
                 updateFaceSettingsUI(data);
                 return;
             }
-            if (!data.available) {
+            if (data.available === false) {
                 if (status) {
                     status.innerHTML = `<strong>Face AI:</strong> Unavailable (${data.message || 'not ready'})`;
                 }
@@ -2828,6 +2845,498 @@
                     updateFaceSettingsUI(data);
                 })
                 .catch(() => {});
+        }
+
+        function updateFrameSyncDebug() {
+            const status = document.getElementById('frame-sync-debug');
+            if (!status) {
+                return;
+            }
+            status.classList.remove('sync-good', 'sync-warn', 'sync-bad', 'sync-neutral');
+
+            const displayed = videoDisplayedFrameSeq > 0 ? videoDisplayedFrameSeq : '-';
+            const applied = lastAppliedFaceFrameSeq > 0 ? lastAppliedFaceFrameSeq : '-';
+            let deltaText = '';
+            let deltaValue = null;
+            if (videoDisplayedFrameSeq > 0 && lastAppliedFaceFrameSeq > 0) {
+                deltaValue = videoDisplayedFrameSeq - lastAppliedFaceFrameSeq;
+                deltaText = ` (Δ ${deltaValue})`;
+
+                const absDelta = Math.abs(deltaValue);
+                const fps = Number(cameraSettings?.fps || 0);
+                const warnThreshold = (Number.isFinite(fps) && fps > 0) ? Math.round(fps) : 30;
+                const goodThreshold = Math.ceil(warnThreshold / 2);
+                if (absDelta <= goodThreshold) {
+                    status.classList.add('sync-good');
+                } else if (absDelta <= warnThreshold) {
+                    status.classList.add('sync-warn');
+                } else {
+                    status.classList.add('sync-bad');
+                }
+            } else {
+                status.classList.add('sync-neutral');
+            }
+            status.innerHTML = `<strong>Sync:</strong> frame ${displayed}, face ${applied}${deltaText}`;
+        }
+
+        function bufferFaceResult(faceResult) {
+            const faceSeq = Number(faceResult?.broadcast_frame_seq || 0);
+            if (!Number.isFinite(faceSeq) || faceSeq <= 0) {
+                latestFaceResult = faceResult || null;
+                drawFaceOverlay();
+                return;
+            }
+
+            pendingFaceResultsBySeq.set(faceSeq, faceResult || null);
+            if (faceSeq <= videoCurrentFrameSeq) {
+                maybeApplyFaceResultForDisplayedFrame();
+            }
+        }
+
+        function attachRemoteAudioMeter(stream) {
+            if (!audioContext || !stream) {
+                return;
+            }
+            if (remoteAudioMeterSource) {
+                try {
+                    remoteAudioMeterSource.disconnect();
+                } catch (_) {}
+                remoteAudioMeterSource = null;
+            }
+            if (remoteAudioMeterProcessor) {
+                remoteAudioMeterProcessor.onaudioprocess = null;
+                try {
+                    remoteAudioMeterProcessor.disconnect();
+                } catch (_) {}
+                remoteAudioMeterProcessor = null;
+            }
+            if (remoteAudioMeterSink) {
+                try {
+                    remoteAudioMeterSink.disconnect();
+                } catch (_) {}
+                remoteAudioMeterSink = null;
+            }
+
+            remoteAudioMeterSource = audioContext.createMediaStreamSource(stream);
+            remoteAudioMeterProcessor = audioContext.createScriptProcessor(2048, 1, 1);
+            remoteAudioMeterSink = audioContext.createGain();
+            remoteAudioMeterSink.gain.value = 0;
+
+            remoteAudioMeterProcessor.onaudioprocess = (event) => {
+                if (!isListening) {
+                    return;
+                }
+                const samples = event.inputBuffer.getChannelData(0);
+                if (!samples || samples.length === 0) {
+                    return;
+                }
+                let sumSq = 0;
+                for (let index = 0; index < samples.length; index += 1) {
+                    sumSq += samples[index] * samples[index];
+                }
+                const rms = Math.sqrt(sumSq / samples.length);
+                updateVolumeMeter('listen-volume-bar', 'listen-volume-text', rmsToPercent(rms), 'listen');
+            };
+
+            remoteAudioMeterSource.connect(remoteAudioMeterProcessor);
+            remoteAudioMeterProcessor.connect(remoteAudioMeterSink);
+            remoteAudioMeterSink.connect(audioContext.destination);
+        }
+
+        function stopPeerConnection() {
+            if (peerConnection) {
+                peerConnection.ontrack = null;
+                peerConnection.onconnectionstatechange = null;
+                peerConnection.close();
+            }
+            peerConnection = null;
+            faceDataChannel = null;
+            talkDataChannel = null;
+            remoteVideoStream = null;
+            remoteAudioStream = null;
+            if (remoteAudioElement) {
+                remoteAudioElement.pause();
+                remoteAudioElement.srcObject = null;
+            }
+            const feed = document.getElementById('video-feed');
+            if (feed) {
+                feed.srcObject = null;
+            }
+            if (remoteAudioMeterSource) {
+                try {
+                    remoteAudioMeterSource.disconnect();
+                } catch (_) {}
+                remoteAudioMeterSource = null;
+            }
+            if (remoteAudioMeterProcessor) {
+                remoteAudioMeterProcessor.onaudioprocess = null;
+                try {
+                    remoteAudioMeterProcessor.disconnect();
+                } catch (_) {}
+                remoteAudioMeterProcessor = null;
+            }
+            if (remoteAudioMeterSink) {
+                try {
+                    remoteAudioMeterSink.disconnect();
+                } catch (_) {}
+                remoteAudioMeterSink = null;
+            }
+        }
+
+        function waitForDataChannelOpen(channel) {
+            if (!channel) {
+                return Promise.reject(new Error('WebRTC data channel unavailable'));
+            }
+            if (channel.readyState === 'open') {
+                return Promise.resolve(channel);
+            }
+            return new Promise((resolve, reject) => {
+                const onOpen = () => {
+                    channel.removeEventListener('error', onError);
+                    resolve(channel);
+                };
+                const onError = () => {
+                    channel.removeEventListener('open', onOpen);
+                    reject(new Error('WebRTC data channel failed to open'));
+                };
+                channel.addEventListener('open', onOpen, { once: true });
+                channel.addEventListener('error', onError, { once: true });
+            });
+        }
+
+        async function ensurePeerConnection() {
+            if (peerConnection && peerConnection.connectionState !== 'closed' && peerConnection.connectionState !== 'failed') {
+                return peerConnection;
+            }
+
+            await initAudioContext();
+            remoteAudioElement = document.getElementById('remote-audio');
+            const feed = document.getElementById('video-feed');
+
+            peerConnection = new RTCPeerConnection();
+            faceDataChannel = peerConnection.createDataChannel('face-data');
+            talkDataChannel = peerConnection.createDataChannel('talk-binary', { ordered: false, maxRetransmits: 0 });
+            faceDataChannel.addEventListener('message', (event) => {
+                try {
+                    const data = JSON.parse(event.data);
+                    if (data?.type === 'frame_meta') {
+                        const metaSeq = Number(data.broadcast_frame_seq || 0);
+                        if (Number.isFinite(metaSeq) && metaSeq > 0) {
+                            // Use server-side frame sequence for stable sync diagnostics.
+                            videoCurrentFrameSeq = metaSeq;
+                            if (videoDisplayedFrameSeq <= 0 || metaSeq > videoDisplayedFrameSeq) {
+                                videoDisplayedFrameSeq = metaSeq;
+                            }
+                            updateFrameSyncDebug();
+                        }
+                        return;
+                    }
+                    if (data?.type === 'face_data') {
+                        handleFaceDataPush(data);
+                    }
+                } catch (_) {}
+            });
+
+            peerConnection.addTransceiver('video', { direction: 'recvonly' });
+            peerConnection.addTransceiver('audio', { direction: 'recvonly' });
+
+            peerConnection.ontrack = (event) => {
+                if (event.track.kind === 'video') {
+                    remoteVideoStream = event.streams[0] || new MediaStream([event.track]);
+                    if (feed) {
+                        feed.srcObject = remoteVideoStream;
+                        const armFrameUpdates = () => {
+                            if (typeof feed.requestVideoFrameCallback === 'function') {
+                                const tick = () => {
+                                    lastVideoFrameAt = Date.now();
+                                    videoDisplayedFrameSeq += 1;
+                                    videoCurrentFrameSeq = videoDisplayedFrameSeq;
+                                    drawFaceOverlay();
+                                    updateFrameSyncDebug();
+                                    feed.requestVideoFrameCallback(tick);
+                                };
+                                feed.requestVideoFrameCallback(tick);
+                            }
+                        };
+                        feed.onloadedmetadata = () => {
+                            lastVideoFrameAt = Date.now();
+                            armFrameUpdates();
+                            feed.play().catch(() => {});
+                            drawFaceOverlay();
+                        };
+                        feed.play().catch(() => {});
+                    }
+                    return;
+                }
+
+                if (event.track.kind === 'audio') {
+                    remoteAudioStream = event.streams[0] || new MediaStream([event.track]);
+                    if (remoteAudioElement) {
+                        remoteAudioElement.srcObject = remoteAudioStream;
+                        remoteAudioElement.muted = !isListening;
+                        remoteAudioElement.play().catch(() => {});
+                    }
+                    attachRemoteAudioMeter(remoteAudioStream);
+                }
+            };
+
+            peerConnection.onconnectionstatechange = () => {
+                updateFrameSyncDebug();
+                if (peerConnection.connectionState === 'disconnected' || peerConnection.connectionState === 'failed' || peerConnection.connectionState === 'closed') {
+                    drawFaceOverlay();
+                    if (!isListening) {
+                        resetVolumeMeter('listen-volume-bar', 'listen-volume-text', 'listen');
+                    }
+                }
+            };
+
+            const offer = await peerConnection.createOffer();
+            await peerConnection.setLocalDescription(offer);
+            await new Promise((resolve) => {
+                if (peerConnection.iceGatheringState === 'complete') {
+                    resolve();
+                    return;
+                }
+                const onIceGatheringStateChange = () => {
+                    if (peerConnection.iceGatheringState === 'complete') {
+                        peerConnection.removeEventListener('icegatheringstatechange', onIceGatheringStateChange);
+                        resolve();
+                    }
+                };
+                peerConnection.addEventListener('icegatheringstatechange', onIceGatheringStateChange);
+            });
+
+            const response = await fetch('/webrtc/connect', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    sdp: peerConnection.localDescription.sdp,
+                    type: peerConnection.localDescription.type
+                })
+            });
+            const answer = await response.json();
+            if (!response.ok) {
+                throw new Error(answer.message || `HTTP ${response.status}`);
+            }
+            await peerConnection.setRemoteDescription(answer);
+            updateFrameSyncDebug();
+            return peerConnection;
+        }
+
+        function startVideoStream() {
+            ensurePeerConnection().catch((error) => {
+                debug(`Video error: ${error.message}`);
+            });
+        }
+
+        function stopVideoStream(options = {}) {
+            const { intentional = true } = options;
+            videoExpectedClose = intentional;
+            stopPeerConnection();
+            videoFrameUrl = null;
+            videoPendingFrameUrl = null;
+            videoPendingFrameSeq = 0;
+            videoCurrentFrameSeq = 0;
+            videoDisplayedFrameSeq = 0;
+            pendingFaceResultsBySeq.clear();
+            lastVideoFrameAt = 0;
+            drawFaceOverlay();
+            updateFrameSyncDebug();
+        }
+
+        async function startListening() {
+            try {
+                await ensurePeerConnection();
+                isListening = true;
+                if (remoteAudioElement) {
+                    remoteAudioElement.muted = false;
+                    remoteAudioElement.play().catch(() => {});
+                }
+                updateUIStatus('listen', true);
+                debug('Starting remote audio stream over WebRTC...');
+            } catch (error) {
+                debug(`Listen error: ${error.message}`);
+                updateUIStatus('listen', false);
+            }
+        }
+
+        function stopListening() {
+            isListening = false;
+            if (remoteAudioElement) {
+                remoteAudioElement.muted = true;
+                remoteAudioElement.pause();
+            }
+            resetVolumeMeter('listen-volume-bar', 'listen-volume-text', 'listen');
+            updateUIStatus('listen', false);
+            debug('Stopped listening');
+        }
+
+        async function startRecordingAudioCapture() {
+            await ensurePeerConnection();
+            if (!remoteAudioStream || remoteAudioStream.getAudioTracks().length === 0) {
+                return null;
+            }
+            return remoteAudioStream.getAudioTracks()[0].clone();
+        }
+
+        function stopRecordingAudioCapture() {
+            detachTalkMicFromRecordingMix();
+            recordingAudioSocket = null;
+            nextRecordingAudioTime = 0;
+        }
+
+        async function startTalking() {
+            try {
+                const sessionId = ++talkSessionId;
+                debug('Requesting microphone permission...');
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    audio: {
+                        echoCancellation: TALKBACK_CONFIG.echoCancellation,
+                        noiseSuppression: TALKBACK_CONFIG.noiseSuppression,
+                        autoGainControl: TALKBACK_CONFIG.autoGainControl,
+                        channelCount: 1,
+                        sampleRate: 48000,
+                        latency: TALKBACK_CONFIG.latencySeconds
+                    }
+                });
+                micStream = stream;
+                debug('Microphone access granted');
+
+                await initAudioContext();
+                await ensurePeerConnection();
+                await ensureTalkWorkletModule();
+                await waitForDataChannelOpen(talkDataChannel);
+
+                isTalking = true;
+                updateUIStatus('talk', true);
+
+                if (isRecordingVideo) {
+                    attachTalkMicToRecordingMix();
+                }
+
+                micSourceNode = audioContext.createMediaStreamSource(stream);
+
+                voiceHighPass = audioContext.createBiquadFilter();
+                voiceHighPass.type = 'highpass';
+                voiceHighPass.frequency.value = TALKBACK_CONFIG.highPassHz;
+
+                voiceLowPass = audioContext.createBiquadFilter();
+		        voiceLowPass.type = 'lowpass';
+		        voiceLowPass.frequency.value = TALKBACK_CONFIG.lowPassHz;
+
+                talkWorkletNode = new AudioWorkletNode(audioContext, 'talk-capture-processor', {
+                    numberOfInputs: 1,
+                    numberOfOutputs: 1,
+                    channelCount: 1,
+                    processorOptions: {
+                        chunkSamples: TALKBACK_CONFIG.chunkSamples
+                    }
+                });
+
+                let sendCount = 0;
+                talkWorkletNode.port.onmessage = (event) => {
+                    if (!isTalking || sessionId !== talkSessionId) return;
+                    if (event.data?.type !== 'chunk') {
+                        return;
+                    }
+
+                    const rms = Number(event.data.rms) || 0;
+                    const volumePercent = rmsToPercent(rms);
+                    updateVolumeMeter('volume-bar', 'volume-text', volumePercent, 'talk');
+
+                    sendCount += 1;
+                    if (sendCount % 10 === 0) {
+                        debug(`Volume: ${volumePercent}% (RMS: ${rms.toFixed(4)})`);
+                    }
+
+                    if (!talkDataChannel || talkDataChannel.readyState !== 'open') {
+                        return;
+                    }
+
+                    try {
+                        talkDataChannel.send(event.data.pcm16);
+                    } catch (sendError) {
+                        debug(`Talkback send failed: ${sendError.message}`);
+                    }
+                };
+
+                micSourceNode.connect(voiceHighPass);
+                voiceHighPass.connect(voiceLowPass);
+                voiceLowPass.connect(talkWorkletNode);
+
+                silentMonitorGain = audioContext.createGain();
+                silentMonitorGain.gain.value = 0;
+                talkWorkletNode.connect(silentMonitorGain);
+                silentMonitorGain.connect(audioContext.destination);
+                debug(`Recording and streaming ${TALKBACK_CONFIG.chunkSamples} samples over WebRTC`);
+            } catch (error) {
+                if (talkWorkletNode) {
+                    talkWorkletNode.port.onmessage = null;
+                    talkWorkletNode.disconnect();
+                    talkWorkletNode = null;
+                }
+                if (voiceLowPass) {
+                    voiceLowPass.disconnect();
+                    voiceLowPass = null;
+                }
+                if (voiceHighPass) {
+                    voiceHighPass.disconnect();
+                    voiceHighPass = null;
+                }
+                if (silentMonitorGain) {
+                    silentMonitorGain.disconnect();
+                    silentMonitorGain = null;
+                }
+                if (micSourceNode) {
+                    micSourceNode.disconnect();
+                    micSourceNode = null;
+                }
+                if (micStream) {
+                    micStream.getTracks().forEach(track => track.stop());
+                    micStream = null;
+                }
+                resetVolumeMeter('volume-bar', 'volume-text', 'talk');
+                updateUIStatus('talk', false);
+                debug(`Microphone error: ${error.message}`);
+                alert('Could not access your microphone. Please check permissions.');
+            }
+        }
+
+        function stopTalking() {
+            isTalking = false;
+            talkSessionId++;
+
+            if (talkWorkletNode) {
+                talkWorkletNode.port.onmessage = null;
+                talkWorkletNode.disconnect();
+                talkWorkletNode = null;
+            }
+            if (voiceLowPass) {
+                voiceLowPass.disconnect();
+                voiceLowPass = null;
+            }
+            if (voiceHighPass) {
+                voiceHighPass.disconnect();
+                voiceHighPass = null;
+            }
+            if (silentMonitorGain) {
+                silentMonitorGain.disconnect();
+                silentMonitorGain = null;
+            }
+            if (micSourceNode) {
+                micSourceNode.disconnect();
+                micSourceNode = null;
+            }
+            if (micStream) {
+                micStream.getTracks().forEach(track => track.stop());
+                micStream = null;
+            }
+
+            detachTalkMicFromRecordingMix();
+
+            resetVolumeMeter('volume-bar', 'volume-text', 'talk');
+            updateUIStatus('talk', false);
+            debug('Recording stopped');
         }
 
         initializeSpeakerVolumeControl();

@@ -52,6 +52,12 @@ type knownFaceSample struct {
 	Mat  gocv.Mat
 }
 
+type detectJob struct {
+	jpegBuffer []byte
+	frameSeq   int64
+	result     chan bool
+}
+
 type Service struct {
 	mu sync.RWMutex
 
@@ -65,6 +71,8 @@ type Service struct {
 	samples         []knownFaceSample
 	cascadePath     string
 	tracks          []faceTrack
+	detectQueue     chan *detectJob
+	workersDone     sync.WaitGroup
 }
 
 type candidateFace struct {
@@ -98,6 +106,7 @@ func New(cfg config.Config) *Service {
 			MaxFaces:           cfg.FaceRecognitionMaxFaces,
 			Result:             LastResult{Faces: []ResultFace{}},
 		},
+		detectQueue: make(chan *detectJob, 4),
 	}
 }
 
@@ -105,22 +114,56 @@ func (s *Service) Init() {
 	s.mu.RLock()
 	enabled := s.status.Enabled
 	s.mu.RUnlock()
+
+	// Start 2 concurrent detection workers.
+	numWorkers := 2
+	for i := 0; i < numWorkers; i++ {
+		s.workersDone.Add(1)
+		go s.detectionWorker()
+	}
+
 	if !enabled {
 		return
 	}
 	s.loadModels()
 }
 
+// detectionWorker processes frames from the detection queue.
+func (s *Service) detectionWorker() {
+	defer s.workersDone.Done()
+	for job := range s.detectQueue {
+		s.processFrameSync(job.jpegBuffer, job.frameSeq)
+		job.result <- true
+	}
+}
+
+// ProcessFrame queues a frame for asynchronous detection.
+// Returns true if queued, false if queue is full (frame dropped).
 func (s *Service) ProcessFrame(jpegBuffer []byte, frameSeq int64) bool {
+	select {
+	case s.detectQueue <- &detectJob{
+		jpegBuffer: jpegBuffer,
+		frameSeq:   frameSeq,
+		result:     make(chan bool, 1),
+	}:
+		return true
+	default:
+		// Queue full, drop frame.
+		return false
+	}
+}
+
+// processFrameSync performs synchronous face detection on a frame.
+func (s *Service) processFrameSync(jpegBuffer []byte, frameSeq int64) {
 	s.mu.Lock()
 	s.frameCounter++
 	if !s.status.Enabled || !s.status.Available || s.status.Initializing || s.processInFlight {
 		s.mu.Unlock()
-		return false
+		return
 	}
 	if s.status.DetectEveryNFrames > 1 && s.frameCounter%int64(s.status.DetectEveryNFrames) != 0 {
 		s.mu.Unlock()
-		return false
+		return
 	}
 
 	s.processInFlight = true
@@ -139,7 +182,7 @@ func (s *Service) ProcessFrame(jpegBuffer []byte, frameSeq int64) bool {
 
 	img, err := gocv.IMDecode(jpegBuffer, gocv.IMReadColor)
 	if err != nil || img.Empty() {
-		return false
+		return
 	}
 	defer img.Close()
 
@@ -203,8 +246,6 @@ func (s *Service) ProcessFrame(jpegBuffer []byte, frameSeq int64) bool {
 	s.status.Result.ImageHeight = img.Rows()
 	s.status.Result.Faces = faces
 	s.mu.Unlock()
-
-	return true
 }
 
 func (s *Service) SetEnabled(enabled bool) {
@@ -240,6 +281,9 @@ func (s *Service) GetStatus() Status {
 }
 
 func (s *Service) Shutdown() {
+	close(s.detectQueue)
+	s.workersDone.Wait()
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	_ = s.classifier.Close()

@@ -10,11 +10,10 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strings"
 	"syscall"
 	"time"
 
-	"github.com/gorilla/websocket"
+	"github.com/pion/webrtc/v4"
 
 	"surveillance-go/internal/config"
 	"surveillance-go/internal/face"
@@ -22,9 +21,8 @@ import (
 )
 
 type server struct {
-	media    *media.Manager
-	face     *face.Service
-	upgrader websocket.Upgrader
+	media *media.Manager
+	face  *face.Service
 }
 
 func main() {
@@ -66,9 +64,8 @@ func main() {
 	})
 
 	s := &server{
-		media:    mediaMgr,
-		face:     faceSvc,
-		upgrader: websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }},
+		media: mediaMgr,
+		face:  faceSvc,
 	}
 
 	mux := http.NewServeMux()
@@ -79,9 +76,7 @@ func main() {
 	mux.HandleFunc("/speaker_volume", s.handleSpeakerVolume)
 	mux.HandleFunc("/face_status", s.handleFaceStatus)
 	mux.HandleFunc("/face_settings", s.handleFaceSettings)
-	mux.HandleFunc("/video_feed", s.handleVideoWS)
-	mux.HandleFunc("/audio_feed", s.handleAudioWS)
-	mux.HandleFunc("/ws/talk", s.handleTalkWS)
+	mux.HandleFunc("/webrtc/connect", s.handleWebRTCConnect)
 
 	publicDir := filepath.Join(mustWd(), "public")
 	mux.Handle("/", http.FileServer(http.Dir(publicDir)))
@@ -245,56 +240,33 @@ func (s *server) handleFaceSettings(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *server) handleVideoWS(w http.ResponseWriter, r *http.Request) {
-	s.handleSubWS(w, r, true)
-}
-
-func (s *server) handleAudioWS(w http.ResponseWriter, r *http.Request) {
-	s.handleSubWS(w, r, false)
-}
-
-func (s *server) handleSubWS(w http.ResponseWriter, r *http.Request, video bool) {
-	conn, err := s.upgrader.Upgrade(w, r, nil)
-	if err != nil {
+func (s *server) handleWebRTCConnect(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	client := media.NewWSClient(conn)
-	if video {
-		s.media.SubscribeVideo(client)
-	} else {
-		s.media.SubscribeAudio(client)
-	}
-	defer func() {
-		if video {
-			s.media.UnsubscribeVideo(client)
-		} else {
-			s.media.UnsubscribeAudio(client)
-		}
-		_ = client.Close()
-	}()
-	for {
-		if _, _, err := conn.ReadMessage(); err != nil {
-			return
-		}
-	}
-}
-
-func (s *server) handleTalkWS(w http.ResponseWriter, r *http.Request) {
-	conn, err := s.upgrader.Upgrade(w, r, nil)
-	if err != nil {
+	var req media.WebRTCSignalRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
-	defer conn.Close()
-	for {
-		msgType, payload, err := conn.ReadMessage()
-		if err != nil {
-			return
-		}
-		if msgType != websocket.BinaryMessage {
-			continue
-		}
-		s.media.WriteTalkback(payload)
+	session, err := media.NewWebRTCSession(webrtc.Configuration{})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
 	}
+	if err := session.BindManager(s.media); err != nil {
+		session.Close(s.media)
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	resp, err := session.Answer(req)
+	if err != nil {
+		session.Close(s.media)
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func writeError(w http.ResponseWriter, code int, msg string) {
@@ -317,10 +289,6 @@ func mustWd() string {
 
 func logMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasPrefix(r.URL.Path, "/video_feed") || strings.HasPrefix(r.URL.Path, "/audio_feed") || strings.HasPrefix(r.URL.Path, "/ws/talk") {
-			next.ServeHTTP(w, r)
-			return
-		}
 		start := time.Now()
 		next.ServeHTTP(w, r)
 		log.Printf("%s %s %s", r.Method, r.URL.Path, time.Since(start).Round(time.Millisecond).String())
