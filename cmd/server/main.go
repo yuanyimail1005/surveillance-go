@@ -47,21 +47,22 @@ func main() {
 		if len(buf) == 0 {
 			return
 		}
-		faceSvc.ProcessFrame(buf, seq)
-		st := faceSvc.GetStatus()
-		mediaMgr.BroadcastVideoJSON(map[string]any{
-			"type":                  "face_data",
-			"enabled":               st.Enabled,
-			"available":             st.Available,
-			"initializing":          st.Initializing,
-			"backend":               st.Backend,
-			"message":               st.Message,
-			"known_faces_count":     st.KnownFacesCount,
-			"detect_every_n_frames": st.DetectEveryNFrames,
-			"match_threshold":       st.MatchThreshold,
-			"max_faces":             st.MaxFaces,
-			"result":                st.Result,
-		})
+		if faceSvc.ProcessFrame(buf, seq) {
+			st := faceSvc.GetStatus()
+			mediaMgr.BroadcastVideoJSON(map[string]any{
+				"type":                  "face_data",
+				"enabled":               st.Enabled,
+				"available":             st.Available,
+				"initializing":          st.Initializing,
+				"backend":               st.Backend,
+				"message":               st.Message,
+				"known_faces_count":     st.KnownFacesCount,
+				"detect_every_n_frames": st.DetectEveryNFrames,
+				"match_threshold":       st.MatchThreshold,
+				"max_faces":             st.MaxFaces,
+				"result":                st.Result,
+			})
+		}
 	})
 
 	s := &server{

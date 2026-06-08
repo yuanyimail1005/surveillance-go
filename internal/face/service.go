@@ -64,6 +64,19 @@ type Service struct {
 	classifier      gocv.CascadeClassifier
 	samples         []knownFaceSample
 	cascadePath     string
+	tracks          []faceTrack
+}
+
+type candidateFace struct {
+	face ResultFace
+	rect image.Rectangle
+}
+
+type faceTrack struct {
+	face        ResultFace
+	rect        image.Rectangle
+	streak      int
+	missedCount int
 }
 
 func New(cfg config.Config) *Service {
@@ -98,16 +111,16 @@ func (s *Service) Init() {
 	s.loadModels()
 }
 
-func (s *Service) ProcessFrame(jpegBuffer []byte, frameSeq int64) {
+func (s *Service) ProcessFrame(jpegBuffer []byte, frameSeq int64) bool {
 	s.mu.Lock()
 	s.frameCounter++
 	if !s.status.Enabled || !s.status.Available || s.status.Initializing || s.processInFlight {
 		s.mu.Unlock()
-		return
+		return false
 	}
 	if s.status.DetectEveryNFrames > 1 && s.frameCounter%int64(s.status.DetectEveryNFrames) != 0 {
 		s.mu.Unlock()
-		return
+		return false
 	}
 
 	s.processInFlight = true
@@ -126,7 +139,7 @@ func (s *Service) ProcessFrame(jpegBuffer []byte, frameSeq int64) {
 
 	img, err := gocv.IMDecode(jpegBuffer, gocv.IMReadColor)
 	if err != nil || img.Empty() {
-		return
+		return false
 	}
 	defer img.Close()
 
@@ -134,13 +147,26 @@ func (s *Service) ProcessFrame(jpegBuffer []byte, frameSeq int64) {
 	defer gray.Close()
 	gocv.CvtColor(img, &gray, gocv.ColorBGRToGray)
 
-	boxes := classifier.DetectMultiScale(gray)
+	minDim := min(gray.Cols(), gray.Rows())
+	minFace := max(36, int(float64(minDim)*0.10))
+	maxFace := int(float64(minDim) * 0.80)
+	boxes := classifier.DetectMultiScaleWithParams(
+		gray,
+		1.10,
+		7,
+		0,
+		image.Pt(minFace, minFace),
+		image.Pt(maxFace, maxFace),
+	)
 	if maxFaces > 0 && len(boxes) > maxFaces {
 		boxes = boxes[:maxFaces]
 	}
 
-	faces := make([]ResultFace, 0, len(boxes))
+	candidates := make([]candidateFace, 0, len(boxes))
 	for _, box := range boxes {
+		if !isPlausibleFaceRect(box, gray.Cols(), gray.Rows()) {
+			continue
+		}
 		normalized, ok := normalizedFaceFromGray(gray, box)
 		if !ok {
 			continue
@@ -157,17 +183,19 @@ func (s *Service) ProcessFrame(jpegBuffer []byte, frameSeq int64) {
 		}
 		normalized.Close()
 
-		faces = append(faces, ResultFace{
+		face := ResultFace{
 			Name:       name,
 			Confidence: confidence,
 			Left:       max(0, box.Min.X),
 			Top:        max(0, box.Min.Y),
 			Right:      min(img.Cols()-1, box.Max.X),
 			Bottom:     min(img.Rows()-1, box.Max.Y),
-		})
+		}
+		candidates = append(candidates, candidateFace{face: face, rect: box})
 	}
 
 	s.mu.Lock()
+	faces := s.updateTracks(candidates)
 	s.status.Result.FrameIndex = s.frameCounter
 	s.status.Result.BroadcastFrameSeq = frameSeq
 	s.status.Result.UpdatedAt = time.Now().UnixMilli()
@@ -175,6 +203,8 @@ func (s *Service) ProcessFrame(jpegBuffer []byte, frameSeq int64) {
 	s.status.Result.ImageHeight = img.Rows()
 	s.status.Result.Faces = faces
 	s.mu.Unlock()
+
+	return true
 }
 
 func (s *Service) SetEnabled(enabled bool) {
@@ -202,7 +232,10 @@ func (s *Service) GetStatus() Status {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	st := s.status
-	st.Result.Faces = append([]ResultFace(nil), s.status.Result.Faces...)
+	st.Result.Faces = append([]ResultFace(nil), st.Result.Faces...)
+	if st.Result.Faces == nil {
+		st.Result.Faces = []ResultFace{}
+	}
 	return st
 }
 
@@ -213,6 +246,7 @@ func (s *Service) Shutdown() {
 	s.classifier = gocv.NewCascadeClassifier()
 	closeSamples(s.samples)
 	s.samples = nil
+	s.tracks = nil
 	s.status.Available = false
 	if s.status.Enabled {
 		s.status.Message = "stopped"
@@ -257,6 +291,7 @@ func (s *Service) loadModels() {
 	s.classifier = classifier
 	closeSamples(s.samples)
 	s.samples = samples
+	s.tracks = nil
 	s.cascadePath = cascadePath
 	s.status.KnownFacesCount = len(samples)
 	s.status.Initializing = false
@@ -400,6 +435,99 @@ func closeSamples(samples []knownFaceSample) {
 	for _, sample := range samples {
 		sample.Mat.Close()
 	}
+}
+
+func isPlausibleFaceRect(rect image.Rectangle, frameW, frameH int) bool {
+	w := rect.Dx()
+	h := rect.Dy()
+	if w <= 0 || h <= 0 {
+		return false
+	}
+	area := w * h
+	if area < 1400 {
+		return false
+	}
+	aspect := float64(w) / float64(h)
+	if aspect < 0.70 || aspect > 1.45 {
+		return false
+	}
+	borderMarginX := int(float64(frameW) * 0.01)
+	borderMarginY := int(float64(frameH) * 0.01)
+	if rect.Min.X <= borderMarginX || rect.Min.Y <= borderMarginY || rect.Max.X >= frameW-borderMarginX || rect.Max.Y >= frameH-borderMarginY {
+		return false
+	}
+	return true
+}
+
+func (s *Service) updateTracks(candidates []candidateFace) []ResultFace {
+	for i := range s.tracks {
+		s.tracks[i].missedCount++
+	}
+
+	usedTrack := make([]bool, len(s.tracks))
+	for _, cand := range candidates {
+		bestIdx := -1
+		bestScore := -1.0
+		for i := range s.tracks {
+			if usedTrack[i] {
+				continue
+			}
+			iou := rectIOU(cand.rect, s.tracks[i].rect)
+			if iou <= 0.10 {
+				continue
+			}
+			if iou > bestScore {
+				bestScore = iou
+				bestIdx = i
+			}
+		}
+
+		if bestIdx >= 0 {
+			usedTrack[bestIdx] = true
+			s.tracks[bestIdx].rect = cand.rect
+			s.tracks[bestIdx].face = cand.face
+			s.tracks[bestIdx].streak++
+			s.tracks[bestIdx].missedCount = 0
+			continue
+		}
+
+		s.tracks = append(s.tracks, faceTrack{
+			face:        cand.face,
+			rect:        cand.rect,
+			streak:      1,
+			missedCount: 0,
+		})
+		usedTrack = append(usedTrack, true)
+	}
+
+	liveTracks := make([]faceTrack, 0, len(s.tracks))
+	for _, t := range s.tracks {
+		if t.missedCount <= 2 {
+			liveTracks = append(liveTracks, t)
+		}
+	}
+	s.tracks = liveTracks
+
+	stable := make([]ResultFace, 0, len(s.tracks))
+	for _, t := range s.tracks {
+		if t.missedCount == 0 && t.streak >= s.cfg.FaceRecognitionMinConsecutiveFrames {
+			stable = append(stable, t.face)
+		}
+	}
+	return stable
+}
+
+func rectIOU(a, b image.Rectangle) float64 {
+	intersection := a.Intersect(b)
+	if intersection.Empty() {
+		return 0
+	}
+	interArea := intersection.Dx() * intersection.Dy()
+	unionArea := (a.Dx() * a.Dy()) + (b.Dx() * b.Dy()) - interArea
+	if unionArea <= 0 {
+		return 0
+	}
+	return float64(interArea) / float64(unionArea)
 }
 
 func resolveCascadePath(overridePath string) string {

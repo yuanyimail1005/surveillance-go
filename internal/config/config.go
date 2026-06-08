@@ -30,12 +30,13 @@ type Config struct {
 	VideoMinFPS             int
 	VideoMaxFPS             int
 
-	FaceRecognitionEnabled            bool
-	FaceRecognitionKnownFacesDir      string
-	FaceRecognitionDetectEveryNFrames int
-	FaceRecognitionMatchThreshold     float64
-	FaceRecognitionMaxFaces           int
-	FaceRecognitionCascadePath        string
+	FaceRecognitionEnabled              bool
+	FaceRecognitionKnownFacesDir        string
+	FaceRecognitionDetectEveryNFrames   int
+	FaceRecognitionMatchThreshold       float64
+	FaceRecognitionMaxFaces             int
+	FaceRecognitionCascadePath          string
+	FaceRecognitionMinConsecutiveFrames int
 }
 
 func Load() Config {
@@ -79,12 +80,17 @@ func Load() Config {
 		VideoMinFPS:             1,
 		VideoMaxFPS:             60,
 
-		FaceRecognitionEnabled:            getenvBool("FACE_RECOGNITION_ENABLED", false),
-		FaceRecognitionKnownFacesDir:      resolve(getenv("FACE_RECOGNITION_KNOWN_FACES_DIR", "./known_faces")),
-		FaceRecognitionDetectEveryNFrames: getenvIntAllowUnset("FACE_RECOGNITION_DETECT_EVERY_N_FRAMES", 0),
-		FaceRecognitionMatchThreshold:     getenvFloat("FACE_RECOGNITION_MATCH_THRESHOLD", 0.6),
-		FaceRecognitionMaxFaces:           getenvInt("FACE_RECOGNITION_MAX_FACES", 8),
-		FaceRecognitionCascadePath:        cascadePath,
+		FaceRecognitionEnabled:              getenvBool("FACE_RECOGNITION_ENABLED", false),
+		FaceRecognitionKnownFacesDir:        resolve(getenv("FACE_RECOGNITION_KNOWN_FACES_DIR", "./known_faces")),
+		FaceRecognitionDetectEveryNFrames:   getenvIntAllowUnset("FACE_RECOGNITION_DETECT_EVERY_N_FRAMES", 0),
+		FaceRecognitionMatchThreshold:       getenvFloat("FACE_RECOGNITION_MATCH_THRESHOLD", 0.6),
+		FaceRecognitionMaxFaces:             getenvInt("FACE_RECOGNITION_MAX_FACES", 8),
+		FaceRecognitionCascadePath:          cascadePath,
+		FaceRecognitionMinConsecutiveFrames: getenvInt("FACE_RECOGNITION_MIN_CONSECUTIVE_FRAMES", 1),
+	}
+
+	if cfg.FaceRecognitionMinConsecutiveFrames < 1 {
+		cfg.FaceRecognitionMinConsecutiveFrames = 1
 	}
 
 	if cfg.FaceRecognitionDetectEveryNFrames <= 0 {
