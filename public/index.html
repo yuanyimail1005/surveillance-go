@@ -734,13 +734,9 @@
         let recordingRotationDegrees = 0;
         let recordingAudioDestination = null;
         let recordingAudioGain = null;
-        let recordingAudioSocket = null;
         let recordingTalkMicSource = null;
         let recordingTalkMicGain = null;
         let nextRecordingAudioTime = 0;
-        let listenSocket = null;
-        let listenReconnectTimer = null;
-        let talkSocket = null;
         let peerConnection = null;
         let peerConnectionInitPromise = null;
         let isRecoveringPeerConnection = false;
@@ -3118,7 +3114,7 @@
         refreshSystemStatus();
         setInterval(refreshSystemStatus, 5000);
 
-        console.log('Page loaded - surveillance system ready');
+        debug('Page loaded - surveillance system ready');
     </script>
 </body>
 </html>
