@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -153,7 +154,9 @@ func (m *Manager) SubscribeAudio(c Subscriber) {
 	m.mu.Unlock()
 
 	if startNeeded {
-		_ = m.startAudioCapture()
+		if err := m.startAudioCapture(); err != nil {
+			log.Printf("media: failed to start audio capture: %v", err)
+		}
 	}
 }
 
@@ -660,8 +663,10 @@ func (m *Manager) broadcastAudio(chunk []byte) {
 	}
 	m.mu.RUnlock()
 
-	for _, c := range clients {
-		_ = c.WriteBinary(chunk)
+	for i, c := range clients {
+		if err := c.WriteBinary(chunk); err != nil {
+			log.Printf("[AUDIO] Failed to send to client %d: %v", i, err)
+		}
 	}
 }
 

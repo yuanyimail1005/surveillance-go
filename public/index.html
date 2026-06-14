@@ -557,7 +557,7 @@
                 <div class="video-feed-wrapper">
                     <video id="video-feed" autoplay playsinline></video>
                     <canvas id="face-overlay"></canvas>
-                    <audio id="remote-audio" autoplay style="display:none;"></audio>
+                    <audio id="remote-audio" autoplay style="position:absolute; left:-9999px; width:1px; height:1px; opacity:0; pointer-events:none;"></audio>
                 </div>
                 <div class="video-tools">
                     <div style="display:flex; gap:12px; align-items:flex-end;">
@@ -742,14 +742,25 @@
         let listenReconnectTimer = null;
         let talkSocket = null;
         let peerConnection = null;
+        let peerConnectionInitPromise = null;
+        let isRecoveringPeerConnection = false;
+        let audioStatsTimer = null;
+        let lastAudioBytesReceived = 0;
+        let lastAudioPacketsReceived = 0;
+        let stalledAudioIntervals = 0;
         let faceDataChannel = null;
         let talkDataChannel = null;
         let remoteVideoStream = null;
         let remoteAudioStream = null;
         let remoteAudioElement = null;
+        let remoteAudioRetryTimer = null;
+        let autoplayRecoveryArmed = false;
         let remoteAudioMeterSource = null;
         let remoteAudioMeterProcessor = null;
         let remoteAudioMeterSink = null;
+        let remoteAudioPlaybackSource = null;
+        let remoteAudioPlaybackGain = null;
+        let remoteAudioPlaybackCompressor = null;
         let talkWorkletModulePromise = null;
         let speakerVolumeDebounceTimer = null;
         let faceStatusTimer = null;
@@ -808,7 +819,7 @@
             if (!audioContext) {
                 audioContext = new (window.AudioContext || window.webkitAudioContext)();
                 listenGainNode = audioContext.createGain();
-                listenGainNode.gain.value = 5;
+                listenGainNode.gain.value = 1.2;
                 listenGainNode.connect(audioContext.destination);
                 debug('Audio context initialized');
             }
@@ -828,54 +839,6 @@
             }
 
             await talkWorkletModulePromise;
-        }
-
-        function createTalkSocket(sessionId) {
-            return new Promise((resolve, reject) => {
-                const scheme = window.location.protocol === 'https:' ? 'wss' : 'ws';
-                const socket = new WebSocket(`${scheme}://${window.location.host}/webrtc/connect`);
-                socket.binaryType = 'arraybuffer';
-
-                socket.addEventListener('open', () => {
-                    debug('Talkback WebSocket connected');
-                    resolve(socket);
-                }, { once: true });
-
-                socket.addEventListener('error', () => {
-                    reject(new Error('WebSocket connection failed'));
-                }, { once: true });
-
-                socket.addEventListener('close', () => {
-                    if (sessionId !== talkSessionId) {
-                        return;
-                    }
-                    debug('Talkback WebSocket disconnected');
-                    if (isTalking) {
-                        stopTalking();
-                    }
-                });
-            });
-        }
-
-        function createListenSocket() {
-            return new Promise((resolve, reject) => {
-                const socket = openBinarySocket('/webrtc/connect', 'arraybuffer');
-
-                socket.addEventListener('open', () => {
-                    resolve(socket);
-                }, { once: true });
-
-                socket.addEventListener('error', () => {
-                    reject(new Error('Audio WebSocket unavailable'));
-                }, { once: true });
-            });
-        }
-
-        function openBinarySocket(path, binaryType) {
-            const scheme = window.location.protocol === 'https:' ? 'wss' : 'ws';
-            const socket = new WebSocket(`${scheme}://${window.location.host}${path}`);
-            socket.binaryType = binaryType;
-            return socket;
         }
 
         function scheduleVideoReconnect() {
@@ -1019,137 +982,6 @@
             if (!videoFrameSwapInProgress) {
                 flushPendingVideoFrame(feed);
             }
-        }
-
-        function startVideoStream() {
-            const feed = document.getElementById('video-feed');
-            if (!feed) return;
-
-            if (feed.dataset.videoFrameDropBound !== '1') {
-                const settleFrameSwap = (event) => {
-                    if (event?.type === 'load') {
-                        lastVideoFrameAt = Date.now();
-                        videoDisplayedFrameSeq = videoCurrentFrameSeq;
-                    }
-                    videoFrameSwapInProgress = false;
-                    maybeApplyFaceResultForDisplayedFrame();
-                    updateFrameSyncDebug();
-                    if (videoPendingFrameUrl) {
-                        flushPendingVideoFrame(feed);
-                    }
-                };
-                feed.addEventListener('load', settleFrameSwap);
-                feed.addEventListener('error', settleFrameSwap);
-                feed.dataset.videoFrameDropBound = '1';
-            }
-
-            if (videoSocket && (videoSocket.readyState === WebSocket.OPEN || videoSocket.readyState === WebSocket.CONNECTING)) {
-                return;
-            }
-
-            if (videoReconnectTimer) {
-                clearTimeout(videoReconnectTimer);
-                videoReconnectTimer = null;
-            }
-
-            videoExpectedClose = false;
-
-            videoSocket = openBinarySocket('/webrtc/connect', 'blob');
-
-            videoSocket.addEventListener('open', () => {
-                videoReconnectAttempt = 0;
-                videoSettingsApplyInProgress = false;
-                debug('Video WebSocket connected');
-            });
-
-            videoSocket.addEventListener('message', (event) => {
-                if (typeof event.data === 'string') {
-                    try {
-                        const msg = JSON.parse(event.data);
-                        if (msg.type === 'frame_meta') {
-                            const metaSeq = Number(msg.broadcast_frame_seq || 0);
-                            if (Number.isFinite(metaSeq) && metaSeq > 0) {
-                                nextVideoFrameSeqFromMeta = metaSeq;
-                            }
-                            return;
-                        }
-                        if (msg.type === 'face_data') {
-                            handleFaceDataPush(msg);
-                        }
-                    } catch (_) {}
-                    return;
-                }
-
-                if (!(event.data instanceof Blob)) {
-                    return;
-                }
-
-                let frameSeq = Number(nextVideoFrameSeqFromMeta || 0);
-                if (!Number.isFinite(frameSeq) || frameSeq <= 0) {
-                    frameSeq = videoCurrentFrameSeq + 1;
-                }
-                nextVideoFrameSeqFromMeta = null;
-                queueVideoFrame(feed, event.data, frameSeq);
-            });
-
-            videoSocket.addEventListener('close', () => {
-                if (videoExpectedClose || videoSettingsApplyInProgress) {
-                    debug('Video WebSocket reconnecting...');
-                } else {
-                    debug('Video WebSocket disconnected');
-                }
-                videoSocket = null;
-                if (!videoExpectedClose) {
-                    scheduleVideoReconnect();
-                }
-            });
-
-            videoSocket.addEventListener('error', () => {
-                const transient =
-                    videoExpectedClose ||
-                    videoSettingsApplyInProgress ||
-                    !videoSocket ||
-                    videoSocket.readyState !== WebSocket.OPEN;
-
-                if (transient) {
-                    debug('Video WebSocket reconnecting...');
-                } else {
-                    debug('Video WebSocket error');
-                }
-            });
-        }
-
-        function stopVideoStream(options = {}) {
-            const { intentional = true } = options;
-
-            if (videoReconnectTimer) {
-                clearTimeout(videoReconnectTimer);
-                videoReconnectTimer = null;
-            }
-
-            if (videoSocket) {
-                videoExpectedClose = intentional;
-                videoSocket.close();
-                videoSocket = null;
-            } else {
-                videoExpectedClose = false;
-            }
-            if (videoFrameUrl) {
-                URL.revokeObjectURL(videoFrameUrl);
-                videoFrameUrl = null;
-            }
-            if (videoPendingFrameUrl) {
-                URL.revokeObjectURL(videoPendingFrameUrl);
-                videoPendingFrameUrl = null;
-            }
-            videoPendingFrameSeq = 0;
-            videoCurrentFrameSeq = 0;
-            videoDisplayedFrameSeq = 0;
-            lastAppliedFaceFrameSeq = 0;
-            nextVideoFrameSeqFromMeta = null;
-            pendingFaceResultsBySeq.clear();
-            videoFrameSwapInProgress = false;
-            updateFrameSyncDebug();
         }
 
         function rmsToPercent(rms) {
@@ -1383,64 +1215,6 @@
                 } catch (_) {}
                 recordingTalkMicGain = null;
             }
-        }
-
-        async function startRecordingAudioCapture() {
-            await initAudioContext();
-
-            if (!recordingAudioDestination) {
-                recordingAudioDestination = audioContext.createMediaStreamDestination();
-                recordingAudioGain = audioContext.createGain();
-                recordingAudioGain.gain.value = 1;
-                recordingAudioGain.connect(recordingAudioDestination);
-            }
-
-            nextRecordingAudioTime = audioContext.currentTime;
-
-            return new Promise((resolve, reject) => {
-                const socket = openBinarySocket('/webrtc/connect', 'arraybuffer');
-                let opened = false;
-
-                socket.addEventListener('open', () => {
-                    opened = true;
-                    recordingAudioSocket = socket;
-                    attachTalkMicToRecordingMix();
-                    resolve(recordingAudioDestination.stream.getAudioTracks()[0] || null);
-                }, { once: true });
-
-                socket.addEventListener('message', (event) => {
-                    if (socket !== recordingAudioSocket || !(event.data instanceof ArrayBuffer)) {
-                        return;
-                    }
-                    pushRecordingAudioChunk(event.data);
-                });
-
-                socket.addEventListener('close', () => {
-                    if (socket === recordingAudioSocket) {
-                        recordingAudioSocket = null;
-                    }
-                    if (isRecordingVideo && opened) {
-                        setRecordingStatus('Recording continues, but Pi audio stream disconnected');
-                    }
-                });
-
-                socket.addEventListener('error', () => {
-                    if (!opened) {
-                        reject(new Error('Unable to connect to Pi audio stream for recording'));
-                    }
-                }, { once: true });
-            });
-        }
-
-        function stopRecordingAudioCapture() {
-            detachTalkMicFromRecordingMix();
-            if (recordingAudioSocket) {
-                if (recordingAudioSocket.readyState === WebSocket.OPEN || recordingAudioSocket.readyState === WebSocket.CONNECTING) {
-                    recordingAudioSocket.close();
-                }
-                recordingAudioSocket = null;
-            }
-            nextRecordingAudioTime = 0;
         }
 
         async function ensureDirectoryPermission(handle) {
@@ -2396,88 +2170,6 @@
             }
         }
 
-        async function startListening() {
-            if (listenSocket && (listenSocket.readyState === WebSocket.OPEN || listenSocket.readyState === WebSocket.CONNECTING)) {
-                return;
-            }
-
-            try {
-                await initAudioContext();
-                isListening = true;
-                if (listenReconnectTimer) {
-                    clearTimeout(listenReconnectTimer);
-                    listenReconnectTimer = null;
-                }
-                nextListenPlayTime = audioContext.currentTime;
-                updateUIStatus('listen', true);
-                debug('Starting remote audio stream over WebSocket...');
-
-                const socket = await createListenSocket();
-                listenSocket = socket;
-                debug('Audio WebSocket connected');
-                socket.addEventListener('message', (event) => {
-                    if (!isListening || !(event.data instanceof ArrayBuffer)) {
-                        return;
-                    }
-
-                    const sampleCount = Math.floor(event.data.byteLength / 2);
-                    if (sampleCount <= 0) {
-                        return;
-                    }
-                    const int16Array = new Int16Array(event.data, 0, sampleCount);
-                    playAudioChunk(int16Array);
-                });
-                socket.addEventListener('close', () => {
-                    if (!isListening) {
-                        return;
-                    }
-                    if (listenSocket === socket) {
-                        listenSocket = null;
-                    }
-                    debug('Remote audio stream ended, reconnecting...');
-                    if (listenReconnectTimer) {
-                        clearTimeout(listenReconnectTimer);
-                    }
-                    listenReconnectTimer = setTimeout(() => {
-                        if (isListening) {
-                            startListening();
-                        }
-                    }, 800);
-                });
-            } catch (error) {
-                debug(`Listen error: ${error.message}`);
-                if (isListening) {
-                    if (listenReconnectTimer) {
-                        clearTimeout(listenReconnectTimer);
-                    }
-                    listenReconnectTimer = setTimeout(() => {
-                        if (isListening) {
-                            startListening();
-                        }
-                    }, 1200);
-                } else {
-                    updateUIStatus('listen', false);
-                }
-            }
-        }
-
-        function stopListening() {
-            isListening = false;
-            if (listenReconnectTimer) {
-                clearTimeout(listenReconnectTimer);
-                listenReconnectTimer = null;
-            }
-            if (listenSocket) {
-                if (listenSocket.readyState === WebSocket.OPEN || listenSocket.readyState === WebSocket.CONNECTING) {
-                    listenSocket.close();
-                }
-                listenSocket = null;
-            }
-            resetVolumeMeter('listen-volume-bar', 'listen-volume-text', 'listen');
-            updateUIStatus('listen', false);
-            debug('Stopped listening');
-        }
-
         // Play audio chunk from remote microphone
         function playAudioChunk(int16Array) {
             try {
@@ -2521,7 +2213,7 @@
                 source.start(nextListenPlayTime);
                 nextListenPlayTime += audioBuffer.duration;
             } catch (error) {
-                console.error('Playback error:', error);
+                console.error('[AUDIO] Playback error:', error);
             }
         }
 
@@ -2532,181 +2224,6 @@
             } else {
                 startTalking();
             }
-        }
-
-        async function startTalking() {
-            try {
-                const sessionId = ++talkSessionId;
-                debug('Requesting microphone permission...');
-                const stream = await navigator.mediaDevices.getUserMedia({
-                    audio: {
-                        echoCancellation: TALKBACK_CONFIG.echoCancellation,
-                        noiseSuppression: TALKBACK_CONFIG.noiseSuppression,
-                        autoGainControl: TALKBACK_CONFIG.autoGainControl,
-                        channelCount: 1,
-                        sampleRate: 48000,
-                        latency: TALKBACK_CONFIG.latencySeconds
-                    }
-                });
-                micStream = stream;
-                debug('Microphone access granted');
-
-                // Check microphone volume
-                const audioTracks = stream.getAudioTracks();
-                console.log('Audio tracks:', audioTracks);
-                audioTracks.forEach(track => {
-                    console.log('Track settings:', track.getSettings());
-                });
-
-                await initAudioContext();
-                await ensureTalkWorkletModule();
-                talkSocket = await createTalkSocket(sessionId);
-                isTalking = true;
-                updateUIStatus('talk', true);
-
-                if (isRecordingVideo) {
-                    attachTalkMicToRecordingMix();
-                }
-
-                micSourceNode = audioContext.createMediaStreamSource(stream);
-
-                // Keep voice frequencies and reduce low-frequency rumble / hiss.
-                voiceHighPass = audioContext.createBiquadFilter();
-                voiceHighPass.type = 'highpass';
-                voiceHighPass.frequency.value = TALKBACK_CONFIG.highPassHz;
-
-                voiceLowPass = audioContext.createBiquadFilter();
-                voiceLowPass.type = 'lowpass';
-                voiceLowPass.frequency.value = TALKBACK_CONFIG.lowPassHz;
-
-                talkWorkletNode = new AudioWorkletNode(audioContext, 'talk-capture-processor', {
-                    numberOfInputs: 1,
-                    numberOfOutputs: 1,
-                    channelCount: 1,
-                    processorOptions: {
-                        chunkSamples: TALKBACK_CONFIG.chunkSamples
-                    }
-                });
-
-                let sendCount = 0;
-                talkWorkletNode.port.onmessage = (event) => {
-                    if (!isTalking || sessionId !== talkSessionId) return;
-
-                    if (event.data?.type !== 'chunk') {
-                        return;
-                    }
-
-                    const rms = Number(event.data.rms) || 0;
-                    const volumePercent = rmsToPercent(rms);
-
-                    updateVolumeMeter('volume-bar', 'volume-text', volumePercent, 'talk');
-
-                    // Log every 10th chunk
-                    sendCount++;
-                    if (sendCount % 10 === 0) {
-                        debug(`Volume: ${volumePercent}% (RMS: ${rms.toFixed(4)})`);
-                    }
-
-                    if (!talkSocket || talkSocket.readyState !== WebSocket.OPEN) {
-                        return;
-                    }
-
-                    try {
-                        talkSocket.send(event.data.pcm16);
-                    } catch (sendError) {
-                        debug(`Talkback send failed: ${sendError.message}`);
-                    }
-                };
-
-                micSourceNode.connect(voiceHighPass);
-                voiceHighPass.connect(voiceLowPass);
-                voiceLowPass.connect(talkWorkletNode);
-
-                // Keep the worklet in a live graph without monitoring audio locally.
-                silentMonitorGain = audioContext.createGain();
-                silentMonitorGain.gain.value = 0;
-                talkWorkletNode.connect(silentMonitorGain);
-                silentMonitorGain.connect(audioContext.destination);
-                debug(`Recording and streaming ${TALKBACK_CONFIG.chunkSamples} samples over WebSocket`);
-
-            } catch (error) {
-                if (talkWorkletNode) {
-                    talkWorkletNode.port.onmessage = null;
-                    talkWorkletNode.disconnect();
-                    talkWorkletNode = null;
-                }
-                if (voiceLowPass) {
-                    voiceLowPass.disconnect();
-                    voiceLowPass = null;
-                }
-                if (voiceHighPass) {
-                    voiceHighPass.disconnect();
-                    voiceHighPass = null;
-                }
-                if (silentMonitorGain) {
-                    silentMonitorGain.disconnect();
-                    silentMonitorGain = null;
-                }
-                if (micSourceNode) {
-                    micSourceNode.disconnect();
-                    micSourceNode = null;
-                }
-                if (micStream) {
-                    micStream.getTracks().forEach(track => track.stop());
-                    micStream = null;
-                }
-                if (talkSocket) {
-                    talkSocket.close();
-                    talkSocket = null;
-                }
-                resetVolumeMeter('volume-bar', 'volume-text', 'talk');
-                updateUIStatus('talk', false);
-                debug(`Microphone error: ${error.message}`);
-                alert('Could not access your microphone. Please check permissions.');
-            }
-        }
-
-        function stopTalking() {
-            isTalking = false;
-            talkSessionId++;
-
-            if (talkWorkletNode) {
-                talkWorkletNode.port.onmessage = null;
-                talkWorkletNode.disconnect();
-                talkWorkletNode = null;
-            }
-            if (voiceLowPass) {
-                voiceLowPass.disconnect();
-                voiceLowPass = null;
-            }
-            if (voiceHighPass) {
-                voiceHighPass.disconnect();
-                voiceHighPass = null;
-            }
-            if (silentMonitorGain) {
-                silentMonitorGain.disconnect();
-                silentMonitorGain = null;
-            }
-            if (micSourceNode) {
-                micSourceNode.disconnect();
-                micSourceNode = null;
-            }
-            if (micStream) {
-                micStream.getTracks().forEach(track => track.stop());
-                micStream = null;
-            }
-            if (talkSocket) {
-                if (talkSocket.readyState === WebSocket.OPEN || talkSocket.readyState === WebSocket.CONNECTING) {
-                    talkSocket.close();
-                }
-                talkSocket = null;
-            }
-
-            detachTalkMicFromRecordingMix();
-
-            resetVolumeMeter('volume-bar', 'volume-text', 'talk');
-            updateUIStatus('talk', false);
-            debug('Recording stopped');
         }
 
         // Update UI status
@@ -2916,11 +2433,41 @@
                 } catch (_) {}
                 remoteAudioMeterSink = null;
             }
+            if (remoteAudioPlaybackSource) {
+                try {
+                    remoteAudioPlaybackSource.disconnect();
+                } catch (_) {}
+                remoteAudioPlaybackSource = null;
+            }
+            if (remoteAudioPlaybackGain) {
+                try {
+                    remoteAudioPlaybackGain.disconnect();
+                } catch (_) {}
+                remoteAudioPlaybackGain = null;
+            }
+            if (remoteAudioPlaybackCompressor) {
+                try {
+                    remoteAudioPlaybackCompressor.disconnect();
+                } catch (_) {}
+                remoteAudioPlaybackCompressor = null;
+            }
 
             remoteAudioMeterSource = audioContext.createMediaStreamSource(stream);
             remoteAudioMeterProcessor = audioContext.createScriptProcessor(2048, 1, 1);
             remoteAudioMeterSink = audioContext.createGain();
             remoteAudioMeterSink.gain.value = 0;
+
+            // Direct WebAudio playback fallback path to avoid media element output routing quirks.
+            remoteAudioPlaybackSource = audioContext.createMediaStreamSource(stream);
+            remoteAudioPlaybackGain = audioContext.createGain();
+            // Keep fallback gain moderate to avoid boosting background noise too much.
+            remoteAudioPlaybackGain.gain.value = 3.5;
+            remoteAudioPlaybackCompressor = audioContext.createDynamicsCompressor();
+            remoteAudioPlaybackCompressor.threshold.value = -20;
+            remoteAudioPlaybackCompressor.knee.value = 24;
+            remoteAudioPlaybackCompressor.ratio.value = 4;
+            remoteAudioPlaybackCompressor.attack.value = 0.003;
+            remoteAudioPlaybackCompressor.release.value = 0.18;
 
             remoteAudioMeterProcessor.onaudioprocess = (event) => {
                 if (!isListening) {
@@ -2941,12 +2488,26 @@
             remoteAudioMeterSource.connect(remoteAudioMeterProcessor);
             remoteAudioMeterProcessor.connect(remoteAudioMeterSink);
             remoteAudioMeterSink.connect(audioContext.destination);
+            remoteAudioPlaybackSource.connect(remoteAudioPlaybackGain);
+            remoteAudioPlaybackGain.connect(remoteAudioPlaybackCompressor);
+            remoteAudioPlaybackCompressor.connect(audioContext.destination);
+            debug('Attached direct WebAudio playback fallback');
         }
 
         function stopPeerConnection() {
+            peerConnectionInitPromise = null;
+            if (audioStatsTimer) {
+                clearInterval(audioStatsTimer);
+                audioStatsTimer = null;
+            }
+            lastAudioBytesReceived = 0;
+            lastAudioPacketsReceived = 0;
+            stalledAudioIntervals = 0;
             if (peerConnection) {
                 peerConnection.ontrack = null;
                 peerConnection.onconnectionstatechange = null;
+                peerConnection.oniceconnectionstatechange = null;
+                peerConnection.onsignalingstatechange = null;
                 peerConnection.close();
             }
             peerConnection = null;
@@ -2981,6 +2542,76 @@
                 } catch (_) {}
                 remoteAudioMeterSink = null;
             }
+            if (remoteAudioPlaybackSource) {
+                try {
+                    remoteAudioPlaybackSource.disconnect();
+                } catch (_) {}
+                remoteAudioPlaybackSource = null;
+            }
+            if (remoteAudioPlaybackGain) {
+                try {
+                    remoteAudioPlaybackGain.disconnect();
+                } catch (_) {}
+                remoteAudioPlaybackGain = null;
+            }
+            if (remoteAudioPlaybackCompressor) {
+                try {
+                    remoteAudioPlaybackCompressor.disconnect();
+                } catch (_) {}
+                remoteAudioPlaybackCompressor = null;
+            }
+        }
+
+        function startAudioReceiverStats() {
+            if (audioStatsTimer || !peerConnection) {
+                return;
+            }
+
+            audioStatsTimer = setInterval(async () => {
+                if (!isListening || !peerConnection) {
+                    return;
+                }
+
+                try {
+                    const stats = await peerConnection.getStats();
+                    let inboundAudio = null;
+
+                    stats.forEach((report) => {
+                        if (report.type === 'inbound-rtp' && report.kind === 'audio') {
+                            inboundAudio = report;
+                        }
+                    });
+
+                    if (!inboundAudio) {
+                        debug('Audio stats: inbound audio report not available yet');
+                        return;
+                    }
+
+                    const bytes = Number(inboundAudio.bytesReceived || 0);
+                    const packets = Number(inboundAudio.packetsReceived || 0);
+                    const lost = Number(inboundAudio.packetsLost || 0);
+                    const jitter = Number(inboundAudio.jitter || 0);
+                    const audioLevel = Number(inboundAudio.audioLevel || 0);
+                    const totalAudioEnergy = Number(inboundAudio.totalAudioEnergy || 0);
+
+                    const bytesDelta = bytes - lastAudioBytesReceived;
+                    const packetsDelta = packets - lastAudioPacketsReceived;
+
+                    lastAudioBytesReceived = bytes;
+                    lastAudioPacketsReceived = packets;
+
+                    if (packetsDelta <= 0) {
+                        stalledAudioIntervals += 1;
+                    } else {
+                        stalledAudioIntervals = 0;
+                    }
+
+                    const stalledSuffix = stalledAudioIntervals >= 2 ? ' [stalled]' : '';
+                    debug(`Audio RTP stats: +${Math.max(0, bytesDelta)} bytes, +${Math.max(0, packetsDelta)} packets, total=${packets}, lost=${lost}, jitter=${jitter.toFixed(5)}, level=${audioLevel.toFixed(5)}, energy=${totalAudioEnergy.toFixed(5)}${stalledSuffix}`);
+                } catch (error) {
+                    debug(`Audio stats error: ${error.message}`);
+                }
+            }, 2000);
         }
 
         function waitForDataChannelOpen(channel) {
@@ -3004,16 +2635,79 @@
             });
         }
 
+        function armAutoplayRecovery() {
+            if (autoplayRecoveryArmed) {
+                return;
+            }
+            autoplayRecoveryArmed = true;
+
+            const unlock = async () => {
+                try {
+                    if (audioContext && audioContext.state === 'suspended') {
+                        await audioContext.resume();
+                    }
+                    if (remoteAudioElement && isListening) {
+                        remoteAudioElement.muted = false;
+                        await remoteAudioElement.play();
+                        debug('Remote audio playback unlocked after user interaction');
+                    }
+                } catch (_) {
+                    return;
+                }
+
+                window.removeEventListener('pointerdown', unlock);
+                window.removeEventListener('keydown', unlock);
+                window.removeEventListener('touchstart', unlock);
+                autoplayRecoveryArmed = false;
+            };
+
+            window.addEventListener('pointerdown', unlock);
+            window.addEventListener('keydown', unlock);
+            window.addEventListener('touchstart', unlock);
+        }
+
+        async function ensureRemoteAudioPlayback(reason = 'unspecified') {
+            if (!remoteAudioElement || !isListening) {
+                return;
+            }
+            try {
+                remoteAudioElement.muted = false;
+                await remoteAudioElement.play();
+                debug(`Remote audio playing (${reason})`);
+            } catch (error) {
+                debug(`Remote audio play blocked (${reason}): ${error.message}`);
+                armAutoplayRecovery();
+                if (remoteAudioRetryTimer) {
+                    clearTimeout(remoteAudioRetryTimer);
+                }
+                remoteAudioRetryTimer = setTimeout(() => {
+                    ensureRemoteAudioPlayback('retry');
+                }, 1200);
+            }
+        }
+
         async function ensurePeerConnection() {
             if (peerConnection && peerConnection.connectionState !== 'closed' && peerConnection.connectionState !== 'failed') {
                 return peerConnection;
             }
+
+            if (peerConnectionInitPromise) {
+                return peerConnectionInitPromise;
+            }
+
+            peerConnectionInitPromise = (async () => {
 
             await initAudioContext();
             remoteAudioElement = document.getElementById('remote-audio');
             const feed = document.getElementById('video-feed');
 
             peerConnection = new RTCPeerConnection();
+            peerConnection.oniceconnectionstatechange = () => {
+                debug(`ICE state: ${peerConnection?.iceConnectionState || 'unknown'}`);
+            };
+            peerConnection.onsignalingstatechange = () => {
+                debug(`Signaling state: ${peerConnection?.signalingState || 'unknown'}`);
+            };
             faceDataChannel = peerConnection.createDataChannel('face-data');
             talkDataChannel = peerConnection.createDataChannel('talk-binary', { ordered: false, maxRetransmits: 0 });
             faceDataChannel.addEventListener('message', (event) => {
@@ -3070,22 +2764,40 @@
                 }
 
                 if (event.track.kind === 'audio') {
+                    debug('Remote audio track received');
                     remoteAudioStream = event.streams[0] || new MediaStream([event.track]);
+                    event.track.onunmute = () => {
+                        debug('Remote audio track unmuted');
+                        ensureRemoteAudioPlayback('track unmuted');
+                    };
+                    event.track.onended = () => {
+                        debug('Remote audio track ended');
+                        if (isListening) {
+                            recoverPeerConnectionForAudio('remote audio track ended');
+                        }
+                    };
                     if (remoteAudioElement) {
                         remoteAudioElement.srcObject = remoteAudioStream;
                         remoteAudioElement.muted = !isListening;
-                        remoteAudioElement.play().catch(() => {});
+                        remoteAudioElement.onloadedmetadata = () => {
+                            ensureRemoteAudioPlayback('audio metadata loaded');
+                        };
+                        ensureRemoteAudioPlayback('audio track attached');
                     }
                     attachRemoteAudioMeter(remoteAudioStream);
                 }
             };
 
             peerConnection.onconnectionstatechange = () => {
+                debug(`Peer connection state: ${peerConnection.connectionState}`);
                 updateFrameSyncDebug();
                 if (peerConnection.connectionState === 'disconnected' || peerConnection.connectionState === 'failed' || peerConnection.connectionState === 'closed') {
                     drawFaceOverlay();
                     if (!isListening) {
                         resetVolumeMeter('listen-volume-bar', 'listen-volume-text', 'listen');
+                    }
+                    if (isListening && (peerConnection.connectionState === 'failed' || peerConnection.connectionState === 'closed')) {
+                        recoverPeerConnectionForAudio(`connection state ${peerConnection.connectionState}`);
                     }
                 }
             };
@@ -3121,6 +2833,12 @@
             await peerConnection.setRemoteDescription(answer);
             updateFrameSyncDebug();
             return peerConnection;
+
+            })().finally(() => {
+                peerConnectionInitPromise = null;
+            });
+
+            return peerConnectionInitPromise;
         }
 
         function startVideoStream() {
@@ -3148,20 +2866,55 @@
             try {
                 await ensurePeerConnection();
                 isListening = true;
-                if (remoteAudioElement) {
-                    remoteAudioElement.muted = false;
-                    remoteAudioElement.play().catch(() => {});
-                }
+                startAudioReceiverStats();
+                await ensureRemoteAudioPlayback('startListening');
                 updateUIStatus('listen', true);
                 debug('Starting remote audio stream over WebRTC...');
             } catch (error) {
+                console.error('[AUDIO] startListening error:', error);
+                isListening = true;
                 debug(`Listen error: ${error.message}`);
+                debug('Audio autoplay blocked; playback will auto-retry on next user interaction.');
+                armAutoplayRecovery();
                 updateUIStatus('listen', false);
+            }
+        }
+
+        async function recoverPeerConnectionForAudio(reason) {
+            if (isRecoveringPeerConnection) {
+                return;
+            }
+            isRecoveringPeerConnection = true;
+            debug(`Recovering peer connection: ${reason}`);
+
+            try {
+                stopPeerConnection();
+                if (!isListening) {
+                    return;
+                }
+                await ensurePeerConnection();
+                await ensureRemoteAudioPlayback(`recovered after ${reason}`);
+                debug('Peer connection recovered for audio');
+            } catch (error) {
+                debug(`Peer recovery failed: ${error.message}`);
+            } finally {
+                isRecoveringPeerConnection = false;
             }
         }
 
         function stopListening() {
             isListening = false;
+            if (audioStatsTimer) {
+                clearInterval(audioStatsTimer);
+                audioStatsTimer = null;
+            }
+            lastAudioBytesReceived = 0;
+            lastAudioPacketsReceived = 0;
+            stalledAudioIntervals = 0;
+            if (remoteAudioRetryTimer) {
+                clearTimeout(remoteAudioRetryTimer);
+                remoteAudioRetryTimer = null;
+            }
             if (remoteAudioElement) {
                 remoteAudioElement.muted = true;
                 remoteAudioElement.pause();
@@ -3172,6 +2925,17 @@
         }
 
         async function startRecordingAudioCapture() {
+            await initAudioContext();
+
+            if (!recordingAudioDestination) {
+                recordingAudioDestination = audioContext.createMediaStreamDestination();
+                recordingAudioGain = audioContext.createGain();
+                recordingAudioGain.gain.value = 1;
+                recordingAudioGain.connect(recordingAudioDestination);
+            }
+
+            nextRecordingAudioTime = audioContext.currentTime;
+
             await ensurePeerConnection();
             if (!remoteAudioStream || remoteAudioStream.getAudioTracks().length === 0) {
                 return null;
@@ -3181,7 +2945,6 @@
 
         function stopRecordingAudioCapture() {
             detachTalkMicFromRecordingMix();
-            recordingAudioSocket = null;
             nextRecordingAudioTime = 0;
         }
 
@@ -3257,6 +3020,7 @@
                         talkDataChannel.send(event.data.pcm16);
                     } catch (sendError) {
                         debug(`Talkback send failed: ${sendError.message}`);
+                        console.error('[TALKBACK] Send error:', sendError);
                     }
                 };
 

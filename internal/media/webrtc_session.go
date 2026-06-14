@@ -2,6 +2,7 @@ package media
 
 import (
 	"errors"
+	"log"
 	"sync"
 
 	"github.com/pion/webrtc/v4"
@@ -48,13 +49,16 @@ func (s *WebRTCSession) BindManager(manager *Manager) error {
 
 	videoSub, err := NewVideoTrackSubscriber(fps)
 	if err != nil {
+		log.Printf("webrtc session: failed to create video subscriber: %v", err)
 		return err
 	}
 	audioSub, err := NewAudioTrackSubscriber(sampleRate, micChannels)
 	if err != nil {
 		_ = videoSub.Close()
+		log.Printf("webrtc session: failed to create audio subscriber: %v", err)
 		return err
 	}
+	log.Printf("webrtc session: subscribers created (fps=%d, sampleRate=%d, micChannels=%d)", fps, sampleRate, micChannels)
 
 	s.videoSub = videoSub
 	s.audioSub = audioSub
@@ -63,6 +67,7 @@ func (s *WebRTCSession) BindManager(manager *Manager) error {
 	if err != nil {
 		_ = audioSub.Close()
 		_ = videoSub.Close()
+		log.Printf("webrtc session: failed to add video track: %v", err)
 		return err
 	}
 	go drainRTCP(videoSender)
@@ -71,14 +76,17 @@ func (s *WebRTCSession) BindManager(manager *Manager) error {
 	if err != nil {
 		_ = audioSub.Close()
 		_ = videoSub.Close()
+		log.Printf("webrtc session: failed to add audio track: %v", err)
 		return err
 	}
 	go drainRTCP(audioSender)
+	log.Printf("webrtc session: audio/video tracks added")
 
 	manager.SubscribeVideo(videoSub)
 	s.videoAttached = true
 	manager.SubscribeAudio(audioSub)
 	s.audioAttached = true
+	log.Printf("webrtc session: manager subscriptions attached")
 
 	s.peer.OnDataChannel(func(dc *webrtc.DataChannel) {
 		switch dc.Label() {
@@ -95,7 +103,8 @@ func (s *WebRTCSession) BindManager(manager *Manager) error {
 	})
 
 	s.peer.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
-		if state == webrtc.PeerConnectionStateClosed || state == webrtc.PeerConnectionStateFailed || state == webrtc.PeerConnectionStateDisconnected {
+		// Treat Disconnected as transient; closing here can prematurely end media tracks.
+		if state == webrtc.PeerConnectionStateClosed || state == webrtc.PeerConnectionStateFailed {
 			s.Close(manager)
 		}
 	})

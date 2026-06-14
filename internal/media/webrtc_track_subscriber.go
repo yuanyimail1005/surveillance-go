@@ -1,8 +1,10 @@
 package media
 
 import (
+	"bufio"
 	"bytes"
 	"io"
+	"log"
 	"os/exec"
 	"strconv"
 	"sync"
@@ -68,10 +70,10 @@ func NewVideoTrackSubscriber(fps int) (*VideoTrackSubscriber, error) {
 	}
 
 	subscriber := &VideoTrackSubscriber{
-		track:     track,
-		stdin:     stdin,
-		cmd:       cmd,
-		done:      make(chan struct{}),
+		track: track,
+		stdin: stdin,
+		cmd:   cmd,
+		done:  make(chan struct{}),
 	}
 	go subscriber.pipeIVF(stdout, fps)
 	return subscriber, nil
@@ -170,6 +172,10 @@ type AudioTrackSubscriber struct {
 	stdin     io.WriteCloser
 	cmd       *exec.Cmd
 	mu        sync.RWMutex
+	writeCnt  int
+	writeByte int
+	startedAt time.Time
+	hasPacket bool
 	closeOnce sync.Once
 	done      chan struct{}
 }
@@ -193,14 +199,18 @@ func NewAudioTrackSubscriber(sampleRate, channels int) (*AudioTrackSubscriber, e
 	cmd := exec.Command(
 		"ffmpeg",
 		"-loglevel", "error",
+		"-fflags", "nobuffer",
 		"-f", "s16le",
 		"-ar", strconv.Itoa(sampleRate),
 		"-ac", strconv.Itoa(channels),
 		"-i", "pipe:0",
+		"-af", "volume=18dB,acompressor=threshold=-24dB:ratio=8:attack=5:release=100:makeup=6dB",
 		"-vn",
 		"-c:a", "libopus",
 		"-application", "lowdelay",
 		"-frame_duration", "20",
+		"-flush_packets", "1",
+		"-page_duration", "20000",
 		"-f", "ogg",
 		"pipe:1",
 	)
@@ -213,18 +223,25 @@ func NewAudioTrackSubscriber(sampleRate, channels int) (*AudioTrackSubscriber, e
 		_ = stdin.Close()
 		return nil, err
 	}
-	cmd.Stderr = io.Discard
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		_ = stdin.Close()
+		return nil, err
+	}
 	if err := cmd.Start(); err != nil {
 		_ = stdin.Close()
 		return nil, err
 	}
+	go streamFFmpegStderr(stderr)
 
 	subscriber := &AudioTrackSubscriber{
-		track: track,
-		stdin: stdin,
-		cmd:   cmd,
-		done:  make(chan struct{}),
+		track:     track,
+		stdin:     stdin,
+		cmd:       cmd,
+		done:      make(chan struct{}),
+		startedAt: time.Now(),
 	}
+	log.Printf("webrtc audio: ffmpeg encoder started (sampleRate=%d, channels=%d)", sampleRate, channels)
 	go subscriber.pipeOgg(stdout)
 	return subscriber, nil
 }
@@ -234,12 +251,26 @@ func (s *AudioTrackSubscriber) Track() *webrtc.TrackLocalStaticSample {
 }
 
 func (s *AudioTrackSubscriber) WriteBinary(payload []byte) error {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.stdin == nil {
 		return nil
 	}
-	_, err := s.stdin.Write(payload)
+	n, err := s.stdin.Write(payload)
+	if n > 0 {
+		s.writeCnt += 1
+		s.writeByte += n
+		if s.writeCnt%500 == 0 {
+			log.Printf("webrtc audio: fed ffmpeg %d chunks", s.writeCnt)
+			since := time.Since(s.startedAt)
+			if !s.hasPacket && since > 2*time.Second {
+				log.Printf("webrtc audio: warning: fed ffmpeg for %s but no opus packets produced yet", since.Truncate(100*time.Millisecond))
+			}
+		}
+	}
+	if err != nil {
+		log.Printf("webrtc audio: failed to write PCM to ffmpeg stdin: %v", err)
+	}
 	return err
 }
 
@@ -271,14 +302,20 @@ func (s *AudioTrackSubscriber) pipeOgg(r io.Reader) {
 	defer close(s.done)
 	reader, _, err := oggreader.NewWith(r)
 	if err != nil {
+		log.Printf("webrtc audio: failed to create ogg reader: %v", err)
 		return
 	}
+	log.Printf("webrtc audio: ogg reader started")
 	const opusClockRate = 48000
 	defaultDuration := 20 * time.Millisecond
 	var lastGranule uint64
+	packetCount := 0
 	for {
 		payload, pageHeader, err := reader.ParseNextPage()
 		if err != nil {
+			if err != io.EOF {
+				log.Printf("webrtc audio: failed to parse ogg page: %v", err)
+			}
 			return
 		}
 		duration := defaultDuration
@@ -290,7 +327,33 @@ func (s *AudioTrackSubscriber) pipeOgg(r io.Reader) {
 		if duration <= 0 {
 			duration = defaultDuration
 		}
-		_ = s.track.WriteSample(media.Sample{Data: payload, Duration: duration})
+		if err := s.track.WriteSample(media.Sample{Data: payload, Duration: duration}); err != nil {
+			log.Printf("webrtc audio: failed to write sample: %v", err)
+			return
+		}
+		packetCount += 1
+		if packetCount == 1 {
+			s.mu.Lock()
+			s.hasPacket = true
+			s.mu.Unlock()
+			log.Printf("webrtc audio: first opus packet written (payload=%d bytes, duration=%s)", len(payload), duration)
+		}
+		if packetCount%1000 == 0 {
+			log.Printf("webrtc audio: wrote %d opus packets", packetCount)
+		}
+	}
+}
+
+func streamFFmpegStderr(r io.Reader) {
+	scanner := bufio.NewScanner(r)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line != "" {
+			log.Printf("webrtc audio ffmpeg: %s", line)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		log.Printf("webrtc audio: failed reading ffmpeg stderr: %v", err)
 	}
 }
 
