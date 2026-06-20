@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 
 	"github.com/joho/godotenv"
 )
@@ -13,6 +14,10 @@ type Config struct {
 	ServerPort  int
 	SSLCertPath string
 	SSLKeyPath  string
+
+	WebRTCICEServers   []string
+	WebRTCTurnUsername string
+	WebRTCTurnPassword string
 
 	CameraDevice string
 	CameraWidth  int
@@ -59,10 +64,13 @@ func Load() Config {
 	}
 
 	cfg := Config{
-		ServerHost:  getenv("SERVER_HOST", "0.0.0.0"),
-		ServerPort:  getenvInt("SERVER_PORT", 5000),
-		SSLCertPath: resolve(getenv("SSL_CERT_PATH", "./cert.pem")),
-		SSLKeyPath:  resolve(getenv("SSL_KEY_PATH", "./key.pem")),
+		ServerHost:         getenv("SERVER_HOST", "0.0.0.0"),
+		ServerPort:         getenvInt("SERVER_PORT", 5000),
+		SSLCertPath:        resolve(getenv("SSL_CERT_PATH", "./cert.pem")),
+		SSLKeyPath:         resolve(getenv("SSL_KEY_PATH", "./key.pem")),
+		WebRTCICEServers:   parseCSV(getenv("WEBRTC_ICE_SERVERS", "stun:stun.l.google.com:19302")),
+		WebRTCTurnUsername: getenv("WEBRTC_TURN_USERNAME", ""),
+		WebRTCTurnPassword: getenv("WEBRTC_TURN_PASSWORD", ""),
 
 		CameraDevice: getenv("CAMERA_DEVICE", "/dev/video0"),
 		CameraWidth:  getenvInt("CAMERA_WIDTH", 1920),
@@ -149,4 +157,16 @@ func getenvBool(key string, fallback bool) bool {
 		}
 	}
 	return fallback
+}
+
+func parseCSV(value string) []string {
+	parts := strings.Split(value, ",")
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		trimmed := strings.TrimSpace(part)
+		if trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	return out
 }

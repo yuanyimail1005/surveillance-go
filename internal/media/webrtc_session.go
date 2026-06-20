@@ -3,9 +3,12 @@ package media
 import (
 	"errors"
 	"log"
+	"strings"
 	"sync"
 
 	"github.com/pion/webrtc/v4"
+
+	"surveillance-go/internal/config"
 )
 
 type WebRTCSignalRequest struct {
@@ -28,12 +31,29 @@ type WebRTCSession struct {
 	mu            sync.Mutex
 }
 
-func NewWebRTCSession(config webrtc.Configuration) (*WebRTCSession, error) {
-	peer, err := webrtc.NewPeerConnection(config)
+func NewWebRTCSession(webrtcConfig webrtc.Configuration) (*WebRTCSession, error) {
+	peer, err := webrtc.NewPeerConnection(webrtcConfig)
 	if err != nil {
 		return nil, err
 	}
 	return &WebRTCSession{peer: peer}, nil
+}
+
+func BuildWebRTCConfiguration(cfg config.Config) webrtc.Configuration {
+	iceServers := make([]webrtc.ICEServer, 0, len(cfg.WebRTCICEServers))
+	for _, serverURL := range cfg.WebRTCICEServers {
+		iceServer := webrtc.ICEServer{URLs: []string{serverURL}}
+		if strings.HasPrefix(serverURL, "turn:") || strings.HasPrefix(serverURL, "turns:") {
+			if cfg.WebRTCTurnUsername != "" {
+				iceServer.Username = cfg.WebRTCTurnUsername
+			}
+			if cfg.WebRTCTurnPassword != "" {
+				iceServer.Credential = cfg.WebRTCTurnPassword
+			}
+		}
+		iceServers = append(iceServers, iceServer)
+	}
+	return webrtc.Configuration{ICEServers: iceServers}
 }
 
 func (s *WebRTCSession) Peer() *webrtc.PeerConnection {

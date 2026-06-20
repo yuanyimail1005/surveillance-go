@@ -97,6 +97,15 @@ WebRTC:
 - Remote media is delivered over native WebRTC audio/video tracks
 - Face metadata and talkback control data travel over WebRTC data channels
 
+## Internet Access
+
+To make the server reachable from outside your LAN, configure ICE servers and expose the signaling port:
+
+- Keep `5000/tcp` reachable for HTTPS signaling.
+- Set `WEBRTC_ICE_SERVERS` to at least one public STUN server.
+- Add TURN credentials if you need it to work reliably behind CGNAT or strict NAT.
+- Use a valid TLS certificate for the public hostname you browse to.
+
 ## Docker
 
 ```bash

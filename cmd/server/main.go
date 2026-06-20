@@ -13,14 +13,13 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/pion/webrtc/v4"
-
 	"surveillance-go/internal/config"
 	"surveillance-go/internal/face"
 	"surveillance-go/internal/media"
 )
 
 type server struct {
+	cfg   config.Config
 	media *media.Manager
 	face  *face.Service
 }
@@ -64,6 +63,7 @@ func main() {
 	})
 
 	s := &server{
+		cfg:   cfg,
 		media: mediaMgr,
 		face:  faceSvc,
 	}
@@ -250,7 +250,7 @@ func (s *server) handleWebRTCConnect(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
-	session, err := media.NewWebRTCSession(webrtc.Configuration{})
+	session, err := media.NewWebRTCSession(media.BuildWebRTCConfiguration(s.cfg))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
