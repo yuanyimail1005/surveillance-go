@@ -104,6 +104,7 @@ To make the server reachable from outside your LAN, configure ICE servers and ex
 - Keep `5000/tcp` reachable for HTTPS signaling.
 - Set `WEBRTC_ICE_SERVERS` to at least one public STUN server.
 - Add TURN credentials if you need it to work reliably behind CGNAT or strict NAT.
+- Constrain ICE media UDP ports with `WEBRTC_MEDIA_PORT_MIN` and `WEBRTC_MEDIA_PORT_MAX` (defaults: `10000` to `15000`).
 - Use a valid TLS certificate for the public hostname you browse to.
 
 ## Docker

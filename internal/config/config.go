@@ -18,6 +18,8 @@ type Config struct {
 	WebRTCICEServers   []string
 	WebRTCTurnUsername string
 	WebRTCTurnPassword string
+	WebRTCMediaPortMin int
+	WebRTCMediaPortMax int
 
 	CameraDevice string
 	CameraWidth  int
@@ -71,6 +73,8 @@ func Load() Config {
 		WebRTCICEServers:   parseCSV(getenv("WEBRTC_ICE_SERVERS", "stun:stun.l.google.com:19302")),
 		WebRTCTurnUsername: getenv("WEBRTC_TURN_USERNAME", ""),
 		WebRTCTurnPassword: getenv("WEBRTC_TURN_PASSWORD", ""),
+		WebRTCMediaPortMin: getenvInt("WEBRTC_MEDIA_PORT_MIN", 10000),
+		WebRTCMediaPortMax: getenvInt("WEBRTC_MEDIA_PORT_MAX", 15000),
 
 		CameraDevice: getenv("CAMERA_DEVICE", "/dev/video0"),
 		CameraWidth:  getenvInt("CAMERA_WIDTH", 1920),
@@ -99,6 +103,22 @@ func Load() Config {
 
 	if cfg.FaceRecognitionMinConsecutiveFrames < 1 {
 		cfg.FaceRecognitionMinConsecutiveFrames = 1
+	}
+
+	if cfg.WebRTCMediaPortMin <= 0 {
+		cfg.WebRTCMediaPortMin = 10000
+	}
+	if cfg.WebRTCMediaPortMax <= 0 {
+		cfg.WebRTCMediaPortMax = 15000
+	}
+	if cfg.WebRTCMediaPortMin > cfg.WebRTCMediaPortMax {
+		cfg.WebRTCMediaPortMin, cfg.WebRTCMediaPortMax = cfg.WebRTCMediaPortMax, cfg.WebRTCMediaPortMin
+	}
+	if cfg.WebRTCMediaPortMin < 1 {
+		cfg.WebRTCMediaPortMin = 1
+	}
+	if cfg.WebRTCMediaPortMax > 65535 {
+		cfg.WebRTCMediaPortMax = 65535
 	}
 
 	if cfg.FaceRecognitionDetectEveryNFrames <= 0 {

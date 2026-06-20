@@ -250,7 +250,11 @@ func (s *server) handleWebRTCConnect(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
-	session, err := media.NewWebRTCSession(media.BuildWebRTCConfiguration(s.cfg))
+	session, err := media.NewWebRTCSession(
+		media.BuildWebRTCConfiguration(s.cfg),
+		uint16(s.cfg.WebRTCMediaPortMin),
+		uint16(s.cfg.WebRTCMediaPortMax),
+	)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return

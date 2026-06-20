@@ -31,8 +31,14 @@ type WebRTCSession struct {
 	mu            sync.Mutex
 }
 
-func NewWebRTCSession(webrtcConfig webrtc.Configuration) (*WebRTCSession, error) {
-	peer, err := webrtc.NewPeerConnection(webrtcConfig)
+func NewWebRTCSession(webrtcConfig webrtc.Configuration, mediaPortMin uint16, mediaPortMax uint16) (*WebRTCSession, error) {
+	settingEngine := webrtc.SettingEngine{}
+	if err := settingEngine.SetEphemeralUDPPortRange(mediaPortMin, mediaPortMax); err != nil {
+		return nil, err
+	}
+
+	api := webrtc.NewAPI(webrtc.WithSettingEngine(settingEngine))
+	peer, err := api.NewPeerConnection(webrtcConfig)
 	if err != nil {
 		return nil, err
 	}
