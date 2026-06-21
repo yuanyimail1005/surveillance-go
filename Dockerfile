@@ -1,35 +1,53 @@
-FROM golang:1.22-bookworm AS build
+# Build stage: Debian Trixie ships OpenCV 4.10 (same as host)
+FROM golang:1.25-trixie AS build
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+      build-essential \
+      pkg-config \
+      libopencv-dev \
+      libopencv-contrib-dev; \
+    rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
 COPY go.mod go.sum* ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=$(go env GOARCH) go build -o /out/surveillance-go ./cmd/server
+RUN go mod vendor && \
+    rm -f \
+      vendor/gocv.io/x/gocv/aruco.go \
+      vendor/gocv.io/x/gocv/aruco.cpp \
+      vendor/gocv.io/x/gocv/aruco.h \
+      vendor/gocv.io/x/gocv/aruco_dictionaries.go && \
+    CGO_ENABLED=1 GOOS=linux GOARCH=$(go env GOARCH) go build -mod=vendor -o /out/surveillance-go ./cmd/server
 
-FROM debian:bookworm-slim
+# Runtime stage: Debian Trixie for matching OpenCV runtime libs
+FROM debian:trixie-slim
 WORKDIR /app
+
+ENV DEBIAN_FRONTEND=noninteractive
 
 RUN set -eux; \
     apt-get update; \
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    apt-get install -y --no-install-recommends \
       ca-certificates \
-      curl \
-      gnupg \
       ffmpeg \
       pulseaudio \
       pulseaudio-utils \
-      v4l-utils; \
-    arch="$(dpkg --print-architecture)"; \
-    if [ "$arch" = "arm64" ] || [ "$arch" = "armhf" ]; then \
-      mkdir -p /etc/apt/keyrings; \
-      curl -fsSL https://archive.raspberrypi.com/debian/raspberrypi.gpg.key \
-        | gpg --dearmor -o /etc/apt/keyrings/raspberrypi-archive-keyring.gpg; \
-      echo "deb [signed-by=/etc/apt/keyrings/raspberrypi-archive-keyring.gpg] http://archive.raspberrypi.com/debian/ bookworm main" \
-        > /etc/apt/sources.list.d/raspi.list; \
-      apt-get update; \
-      DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends rpicam-apps; \
-    fi; \
+      v4l-utils \
+      libopencv-dev \
+      libopencv-contrib-dev; \
     rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /out/surveillance-go /app/surveillance-go
+COPY public /app/public
+COPY .env.example /app/.env.example
+
+EXPOSE 5000
+CMD ["/app/surveillance-go"]
 
 COPY --from=build /out/surveillance-go /app/surveillance-go
 COPY public /app/public

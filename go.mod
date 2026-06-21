@@ -8,7 +8,7 @@ require (
 	github.com/pion/webrtc/v4 v4.0.7
 )
 
-require gocv.io/x/gocv v0.40.0
+require gocv.io/x/gocv v0.43.0
 
 require (
 	github.com/google/uuid v1.6.0 // indirect

@@ -14,13 +14,15 @@ services:
       SSL_CERT_PATH: /app/cert.pem
       SSL_KEY_PATH: /app/key.pem
       FACE_RECOGNITION_KNOWN_FACES_DIR: /known_faces
+      FACE_RECOGNITION_CASCADE_PATH: /app/haarcascade_frontalface_default.xml
       XDG_RUNTIME_DIR: /run/user/1000
       PULSE_SERVER: unix:/run/user/1000/pulse/native
       PULSE_COOKIE: /tmp/pulse-cookie
     volumes:
-      - ./cert.pem:/app/cert.pem:ro
-      - ./key.pem:/app/key.pem:ro
-      - ${FACE_RECOGNITION_KNOWN_FACES_DIR:-./known_faces}:/known_faces:ro
+      - /home/eric/certs/cert.pem:/app/cert.pem:ro
+      - /home/eric/certs/key.pem:/app/key.pem:ro
+      - /usr/share/opencv4/haarcascades/haarcascade_frontalface_default.xml:/app/haarcascade_frontalface_default.xml:ro
+      - ${FACE_RECOGNITION_KNOWN_FACES_DIR:-./known_faces}:/known_faces
       - /dev:/dev
       - /dev/snd:/dev/snd
       - /run/user/1000/pulse/native:/run/user/1000/pulse/native
