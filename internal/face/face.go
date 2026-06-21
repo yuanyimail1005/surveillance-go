@@ -1,6 +1,7 @@
 package face
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"image"
@@ -59,6 +60,11 @@ type knownFaceSample struct {
 type cacheEntry struct {
 	Path      string `json:"path"`
 	Signature string `json:"signature"`
+	NoFace    bool   `json:"no_face,omitempty"`
+	Rows      int    `json:"rows,omitempty"`
+	Cols      int    `json:"cols,omitempty"`
+	Type      int    `json:"type,omitempty"`
+	Data      string `json:"data,omitempty"`
 }
 
 type faceCache struct {
@@ -353,13 +359,13 @@ func (s *Service) loadModels() {
 		persistedCache = make(map[string]cacheEntry)
 	}
 
-	samples, cache, err := loadKnownFaceSamples(classifier, s.cfg.FaceRecognitionKnownFacesDir, currentCache, persistedCache)
+	samples, cache, persistedEntries, err := loadKnownFaceSamples(classifier, s.cfg.FaceRecognitionKnownFacesDir, currentCache, persistedCache)
 	if err != nil {
 		_ = classifier.Close()
 		s.finishInitError(err.Error())
 		return
 	}
-	if err := saveFaceCache(s.cfg.FaceRecognitionKnownFacesDir, samples); err != nil {
+	if err := saveFaceCache(s.cfg.FaceRecognitionKnownFacesDir, persistedEntries); err != nil {
 		log.Printf("face: warning - failed to save cache: %v", err)
 	}
 	log.Printf("face: loaded %d known face sample(s)", len(samples))
@@ -390,15 +396,15 @@ func (s *Service) finishInitError(message string) {
 	s.status.Message = "initialization failed: " + message
 }
 
-func loadKnownFaceSamples(classifier gocv.CascadeClassifier, knownFacesDir string, previousCache map[string]knownFaceSample, persistedCache map[string]cacheEntry) ([]knownFaceSample, map[string]knownFaceSample, error) {
+func loadKnownFaceSamples(classifier gocv.CascadeClassifier, knownFacesDir string, previousCache map[string]knownFaceSample, persistedCache map[string]cacheEntry) ([]knownFaceSample, map[string]knownFaceSample, map[string]cacheEntry, error) {
 	log.Printf("face: scanning known faces directory %s", knownFacesDir)
 	entries, err := os.ReadDir(knownFacesDir)
 	if err != nil {
 		if os.IsNotExist(err) {
 			log.Printf("face: known faces directory does not exist: %s", knownFacesDir)
-			return nil, nil, nil
+			return nil, nil, nil, nil
 		}
-		return nil, nil, fmt.Errorf("failed to read known faces dir: %w", err)
+		return nil, nil, nil, fmt.Errorf("failed to read known faces dir: %w", err)
 	}
 
 	persons := make([]string, 0)
@@ -411,12 +417,13 @@ func loadKnownFaceSamples(classifier gocv.CascadeClassifier, knownFacesDir strin
 
 	samples := make([]knownFaceSample, 0)
 	updatedCache := make(map[string]knownFaceSample)
+	updatedPersisted := make(map[string]cacheEntry)
 	for _, person := range persons {
 		personDir := filepath.Join(knownFacesDir, person)
 		log.Printf("face: loading known face samples for %s", person)
 		images, err := os.ReadDir(personDir)
 		if err != nil {
-			return nil, nil, fmt.Errorf("failed to read known face person dir %s: %w", personDir, err)
+			return nil, nil, nil, fmt.Errorf("failed to read known face person dir %s: %w", personDir, err)
 		}
 		sort.Slice(images, func(i, j int) bool {
 			return images[i].Name() < images[j].Name()
@@ -431,30 +438,62 @@ func loadKnownFaceSamples(classifier gocv.CascadeClassifier, knownFacesDir strin
 				continue
 			}
 			imgPath := filepath.Join(personDir, imgEntry.Name())
+			cacheKey, err := knownFaceCacheKey(knownFacesDir, imgPath)
+			if err != nil {
+				return nil, nil, nil, err
+			}
 			info, err := imgEntry.Info()
 			if err != nil {
-				return nil, nil, fmt.Errorf("failed to stat known face image %s: %w", imgPath, err)
+				return nil, nil, nil, fmt.Errorf("failed to stat known face image %s: %w", imgPath, err)
 			}
 			signature := fmt.Sprintf("%d:%d", info.Size(), info.ModTime().UnixNano())
 			if previousCache != nil {
-				if cached, ok := previousCache[imgPath]; ok && cached.Signature == signature {
+				if cached, ok := previousCache[cacheKey]; ok && cached.Signature == signature {
 					log.Printf("face: cache hit for %s", imgPath)
 					samples = append(samples, cached)
-					updatedCache[imgPath] = cached
+					updatedCache[cacheKey] = cached
+					entry := cacheEntry{Path: cacheKey, Signature: signature}
+					if encoded, ok := sampleToCacheEntry(cached.Mat); ok {
+						entry.Rows = encoded.Rows
+						entry.Cols = encoded.Cols
+						entry.Type = encoded.Type
+						entry.Data = encoded.Data
+					}
+					updatedPersisted[cacheKey] = entry
 					loadedForPerson++
 					continue
 				}
 			}
 			if persistedCache != nil {
-				if cached, ok := persistedCache[imgPath]; ok && cached.Signature == signature {
-					log.Printf("face: persisted cache hit (skipping reload) for %s", imgPath)
-					continue
+				if cached, ok := persistedCache[cacheKey]; ok && cached.Signature == signature {
+					if cached.NoFace {
+						log.Printf("face: persisted negative cache hit for %s", imgPath)
+						updatedPersisted[cacheKey] = cacheEntry{Path: cacheKey, Signature: signature, NoFace: true}
+						continue
+					}
+					if restored, ok := sampleFromCacheEntry(person, cacheKey, signature, cached); ok {
+						log.Printf("face: persisted cache hit for %s", imgPath)
+						samples = append(samples, restored)
+						updatedCache[cacheKey] = restored
+						updatedPersisted[cacheKey] = cacheEntry{
+							Path:      cacheKey,
+							Signature: signature,
+							Rows:      cached.Rows,
+							Cols:      cached.Cols,
+							Type:      cached.Type,
+							Data:      cached.Data,
+						}
+						loadedForPerson++
+						continue
+					}
+					log.Printf("face: persisted cache metadata hit for %s; rebuilding sample", imgPath)
 				}
 			}
 			log.Printf("face: reading known face image %s", imgPath)
 			img := gocv.IMRead(imgPath, gocv.IMReadColor)
 			if img.Empty() {
 				log.Printf("face: skipping unreadable image %s", imgPath)
+				updatedPersisted[cacheKey] = cacheEntry{Path: cacheKey, Signature: signature, NoFace: true}
 				img.Close()
 				continue
 			}
@@ -465,6 +504,7 @@ func loadKnownFaceSamples(classifier gocv.CascadeClassifier, knownFacesDir strin
 
 			faces := classifier.DetectMultiScale(gray)
 			if len(faces) == 0 {
+				updatedPersisted[cacheKey] = cacheEntry{Path: cacheKey, Signature: signature, NoFace: true}
 				gray.Close()
 				continue
 			}
@@ -479,12 +519,21 @@ func loadKnownFaceSamples(classifier gocv.CascadeClassifier, knownFacesDir strin
 			gray.Close()
 			if !ok {
 				log.Printf("face: no usable face found in %s", imgPath)
+				updatedPersisted[cacheKey] = cacheEntry{Path: cacheKey, Signature: signature, NoFace: true}
 				continue
 			}
 
-			sample := knownFaceSample{Name: person, Path: imgPath, Signature: signature, Mat: faceMat}
+			sample := knownFaceSample{Name: person, Path: cacheKey, Signature: signature, Mat: faceMat}
 			samples = append(samples, sample)
-			updatedCache[imgPath] = sample
+			updatedCache[cacheKey] = sample
+			entry := cacheEntry{Path: cacheKey, Signature: signature}
+			if encoded, ok := sampleToCacheEntry(sample.Mat); ok {
+				entry.Rows = encoded.Rows
+				entry.Cols = encoded.Cols
+				entry.Type = encoded.Type
+				entry.Data = encoded.Data
+			}
+			updatedPersisted[cacheKey] = entry
 			loadedForPerson++
 		}
 		log.Printf("face: loaded %d sample(s) for %s", loadedForPerson, person)
@@ -497,7 +546,7 @@ func loadKnownFaceSamples(classifier gocv.CascadeClassifier, knownFacesDir strin
 		}
 	}
 	log.Printf("face: finished loading known faces, total samples=%d", len(samples))
-	return samples, updatedCache, nil
+	return samples, updatedCache, updatedPersisted, nil
 }
 
 func normalizedFaceFromGray(gray gocv.Mat, rect image.Rectangle) (gocv.Mat, bool) {
@@ -713,15 +762,28 @@ func max(a, b int) int {
 	return b
 }
 
-func saveFaceCache(knownFacesDir string, samples []knownFaceSample) error {
+func saveFaceCache(knownFacesDir string, entryByPath map[string]cacheEntry) error {
 	cacheFile := filepath.Join(knownFacesDir, ".face_sample_cache.json")
-	entries := make([]cacheEntry, 0, len(samples))
-	for _, sample := range samples {
-		entries = append(entries, cacheEntry{
-			Path:      sample.Path,
-			Signature: sample.Signature,
-		})
+	entries := make([]cacheEntry, 0, len(entryByPath))
+	for _, cached := range entryByPath {
+		key, err := knownFaceCacheKeyFromStoredPath(knownFacesDir, cached.Path)
+		if err != nil {
+			return err
+		}
+		entry := cacheEntry{
+			Path:      key,
+			Signature: cached.Signature,
+			NoFace:    cached.NoFace,
+			Rows:      cached.Rows,
+			Cols:      cached.Cols,
+			Type:      cached.Type,
+			Data:      cached.Data,
+		}
+		entries = append(entries, entry)
 	}
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].Path < entries[j].Path
+	})
 	cache := faceCache{
 		Version: faceCacheVersion,
 		Entries: entries,
@@ -756,8 +818,70 @@ func loadFaceCache(knownFacesDir string) (map[string]cacheEntry, error) {
 	}
 	entries := make(map[string]cacheEntry)
 	for _, entry := range cache.Entries {
-		entries[entry.Path] = entry
+		key, err := knownFaceCacheKeyFromStoredPath(knownFacesDir, entry.Path)
+		if err != nil {
+			return nil, err
+		}
+		entry.Path = key
+		entries[key] = entry
 	}
 	log.Printf("face: loaded cache with %d entries from %s", len(entries), cacheFile)
 	return entries, nil
+}
+
+func sampleToCacheEntry(mat gocv.Mat) (cacheEntry, bool) {
+	if mat.Empty() {
+		return cacheEntry{}, false
+	}
+	data, err := mat.DataPtrUint8()
+	if err != nil || len(data) == 0 {
+		return cacheEntry{}, false
+	}
+	return cacheEntry{
+		Rows: mat.Rows(),
+		Cols: mat.Cols(),
+		Type: int(mat.Type()),
+		Data: base64.StdEncoding.EncodeToString(data),
+	}, true
+}
+
+func sampleFromCacheEntry(name, path, signature string, entry cacheEntry) (knownFaceSample, bool) {
+	if entry.Rows <= 0 || entry.Cols <= 0 || entry.Data == "" {
+		return knownFaceSample{}, false
+	}
+	raw, err := base64.StdEncoding.DecodeString(entry.Data)
+	if err != nil || len(raw) == 0 {
+		return knownFaceSample{}, false
+	}
+	mat, err := gocv.NewMatFromBytes(entry.Rows, entry.Cols, gocv.MatType(entry.Type), raw)
+	if err != nil || mat.Empty() {
+		return knownFaceSample{}, false
+	}
+	return knownFaceSample{Name: name, Path: path, Signature: signature, Mat: mat}, true
+}
+
+func knownFaceCacheKey(knownFacesDir, imagePath string) (string, error) {
+	rel, err := filepath.Rel(knownFacesDir, imagePath)
+	if err != nil {
+		return "", fmt.Errorf("failed to compute known face cache key for %s: %w", imagePath, err)
+	}
+	if strings.HasPrefix(rel, "..") {
+		return "", fmt.Errorf("known face image path is outside known faces dir: %s", imagePath)
+	}
+	return filepath.ToSlash(rel), nil
+}
+
+func knownFaceCacheKeyFromStoredPath(knownFacesDir, storedPath string) (string, error) {
+	p := filepath.Clean(strings.TrimSpace(storedPath))
+	if p == "" {
+		return "", fmt.Errorf("invalid empty known face cache path")
+	}
+	if filepath.IsAbs(p) {
+		return knownFaceCacheKey(knownFacesDir, p)
+	}
+	normalized := filepath.ToSlash(p)
+	if strings.HasPrefix(normalized, "../") || normalized == ".." {
+		return "", fmt.Errorf("known face cache path escapes directory: %s", storedPath)
+	}
+	return normalized, nil
 }
