@@ -2,7 +2,7 @@
 
 Go implementation of the Raspberry Pi surveillance system with browser-based live video/audio, two-way talkback, camera and audio controls, snapshot capture, and video recording.
 
-The HTTP control API remains aligned with the Node implementation in `/home/eric/surveillance-node`, while live media transport now uses WebRTC instead of WebSocket media sockets.
+The HTTP control API remains aligned with the Node implementation in `${HOME}/surveillance-node`, while live media transport now uses WebRTC instead of WebSocket media sockets.
 
 ## Features
 
@@ -50,14 +50,14 @@ sudo apt-get install -y libopencv-dev libopencv-contrib-dev
 Copy env template:
 
 ```bash
-cd /home/eric/surveillance-go
+cd ${HOME}/surveillance-go
 cp .env.example .env
 ```
 
 Generate a self-signed certificate if needed:
 
 ```bash
-cd /home/eric/surveillance-go
+cd ${HOME}/surveillance-go
 chmod +x scripts/gen-cert.sh
 ./scripts/gen-cert.sh
 ```
@@ -65,7 +65,7 @@ chmod +x scripts/gen-cert.sh
 ## Run Locally
 
 ```bash
-cd /home/eric/surveillance-go
+cd ${HOME}/surveillance-go
 go mod tidy
 go run ./cmd/server
 ```
@@ -110,7 +110,7 @@ To make the server reachable from outside your LAN, configure ICE servers and ex
 ## Docker
 
 ```bash
-cd /home/eric/surveillance-go
+cd ${HOME}/surveillance-go
 sudo docker compose build
 sudo docker compose up -d
 ```

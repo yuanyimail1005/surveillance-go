@@ -19,14 +19,14 @@ services:
       PULSE_SERVER: unix:/run/user/1000/pulse/native
       PULSE_COOKIE: /tmp/pulse-cookie
     volumes:
-      - /home/eric/certs/cert.pem:/app/cert.pem:ro
-      - /home/eric/certs/key.pem:/app/key.pem:ro
+      - ${HOME}/certs/cert.pem:/app/cert.pem:ro
+      - ${HOME}/certs/key.pem:/app/key.pem:ro
       - /usr/share/opencv4/haarcascades/haarcascade_frontalface_default.xml:/app/haarcascade_frontalface_default.xml:ro
       - ${FACE_RECOGNITION_KNOWN_FACES_DIR:-./known_faces}:/known_faces
       - /dev:/dev
       - /dev/snd:/dev/snd
       - /run/user/1000/pulse/native:/run/user/1000/pulse/native
-      - /home/eric/.config/pulse/cookie:/tmp/pulse-cookie:ro
+      - ${HOME}/.config/pulse/cookie:/tmp/pulse-cookie:ro
       - /run/udev:/run/udev:ro
     group_add:
       - audio
